@@ -19,6 +19,7 @@ import {
   activeEfforts,
   highestEffort,
   lowestEffort,
+  llmText,
 } from '../src/spawn-model-choice.mjs'
 
 describe('spawn-model-choice helpers', () => {
@@ -272,25 +273,19 @@ describe('spawn-model-choice helpers', () => {
   })
 
   describe('llmText single-assembly and terminal failure', () => {
-    // Replicate the plugin's fixed llmText collection logic (text-delta only, finish guard)
+    // Drive the REAL llmText through a fake ctx whose llm.stream yields the
+    // given chunks; captures the stream call options for forwarding checks.
+    const streamCalls: Array<Record<string, unknown>> = []
     async function fixedLlmText(stream: AsyncIterable<Record<string, unknown>>): Promise<string> {
-      let text = ''
-      let finished = false
-      for await (const chunk of stream) {
-        if ((chunk as { type?: string })?.type === 'text-delta' && typeof (chunk as { text?: unknown }).text === 'string') {
-          text += (chunk as { text: string }).text
-          continue
-        }
-        if ((chunk as { type?: string })?.type === 'finish') {
-          finished = true
-          const reason = (chunk as { reason?: { kind?: string; failure?: { message?: string } } }).reason
-          if (reason?.kind === 'error' || reason?.kind === 'aborted') {
-            throw new Error(reason.failure?.message ?? `LLM request ended with ${reason.kind}`)
-          }
-        }
+      const fakeCtx = {
+        llm: {
+          stream: (opts: Record<string, unknown>) => {
+            streamCalls.push(opts)
+            return stream
+          },
+        },
       }
-      if (!finished) throw new Error('LLM stream ended without a terminal finish chunk')
-      return text
+      return llmText(fakeCtx as never, { provider: 'p', model: 'm' }, [] as never, undefined, {})
     }
 
     async function* fakeStreamSingleAssembly(): AsyncIterable<Record<string, unknown>> {
@@ -321,6 +316,13 @@ describe('spawn-model-choice helpers', () => {
         yield { type: 'text-delta', text: 'hi' }
       }
       await expect(fixedLlmText(noFinish())).rejects.toThrow('without a terminal finish chunk')
+    })
+
+    it('terminal failure: empty text with a stop finish throws (budget eaten by reasoning)', async () => {
+      async function* emptyStop(): AsyncIterable<Record<string, unknown>> {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }
+      await expect(fixedLlmText(emptyStop())).rejects.toThrow('with no text output')
     })
   })
 

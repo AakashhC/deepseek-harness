@@ -371,10 +371,11 @@ async function pluginUserMessage(text) {
 async function llmText(ctx, judge, messages, signal, options = {}) {
   let text = ''
   let finished = false
+  let finishKind
   const stream = ctx.llm.stream({
     provider: judge.provider,
     model: judge.model,
-    maxTokens: 64,
+    maxTokens: options.maxTokens ?? 64,
     messages,
     ...(options.system !== undefined ? { system: options.system } : {}),
     ...(options.effort !== undefined ? { reasoningEffort: options.effort } : {}),
@@ -387,14 +388,19 @@ async function llmText(ctx, judge, messages, signal, options = {}) {
     }
     if (chunk?.type === 'finish') {
       finished = true
-      const reason = chunk.reason
-      if (reason?.kind === 'error' || reason?.kind === 'aborted') {
-        throw new Error(reason.failure?.message ?? `LLM request ended with ${reason.kind}`)
+      finishKind = chunk.reason?.kind
+      if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+        throw new Error(chunk.reason.failure?.message ?? `LLM request ended with ${chunk.reason.kind}`)
       }
     }
   }
   if (!finished) {
     throw new Error('LLM stream ended without a terminal finish chunk')
+  }
+  if (text === '') {
+    // An empty stop is a failed helper call (budget eaten by reasoning or a
+    // silent decline) — never masquerade as a valid empty output.
+    throw new Error(`LLM request finished (${finishKind}) with no text output`)
   }
   return text
 }
@@ -430,16 +436,21 @@ function extractJson(text) {
  * single bounded retry (quoting the offending reply) happens before failing
  * open.
  */
-async function llmJson(ctx, judge, system, user, signal) {
+async function llmJson(ctx, judge, system, user, signal, effort) {
   const messages = [await pluginUserMessage(user)]
-  const text = await llmText(ctx, judge, messages, signal, { system })
+  // The mapping prompt is long and the judge may reason: give it room and run
+  // at its LOWEST declared effort (a cheap, narrow judgment — same as the
+  // classifier). Without an explicit effort the parent's premium default can
+  // burn the whole budget on hidden reasoning and emit zero text.
+  const options = { system, maxTokens: 256, ...(effort !== undefined ? { effort } : {}) }
+  const text = await llmText(ctx, judge, messages, signal, options)
   const parsed = extractJson(text)
   if (parsed !== undefined) return parsed
   try {
     const retry = await llmText(ctx, judge, [await pluginUserMessage(
       `Your previous reply contained no JSON object. Quoted reply: ${JSON.stringify(text.slice(0, 300))}\n`
       + 'Reply with ONLY a JSON object in exactly the requested shape — no markdown, no prose.',
-    )], signal, { system })
+    )], signal, options)
     return extractJson(retry)
   } catch {
     return undefined
@@ -509,7 +520,7 @@ function boundedTable(table, text) {
  * BOUNDED shortlist of live entries. Returns a choice matching a real table
  * entry, or `undefined` when it cannot resolve.
  */
-async function resolveCustomAnswer(ctx, judge, text, table, signal) {
+async function resolveCustomAnswer(ctx, judge, text, table, signal, judgeEffort) {
   const lines = [...table.values()]
     .map((e) => `- ${e.provider}/${e.model} (${e.name}); efforts: ${activeEfforts(e).join(', ') || 'none'}${priceSuffix(e)}`)
     .join('\n')
@@ -525,6 +536,7 @@ async function resolveCustomAnswer(ctx, judge, text, table, signal) {
     + `Reply with ONLY a JSON object, no markdown, no other text, in exactly this shape: `
     + '{"provider":"...","model":"...","effort":"..."} or {"provider":null}',
     signal,
+    judgeEffort,
   )
   logLine(`resolveCustom: reply=${JSON.stringify(reply)}`)
   if (!reply || reply.provider === null) return undefined
@@ -708,7 +720,11 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     }
     let resolved
     try {
-      resolved = await resolveCustomAnswer(ctx, judge, text, boundedTable(table, text), request.signal)
+      // Run the judge at its LOWEST declared effort: the mapping is a narrow
+      // judgment, and the parent's premium default effort can burn the whole
+      // token budget on hidden reasoning (zero visible text).
+      const judgeEffort = activeEfforts(table.get(`${judge.provider}/${judge.model}`) ?? {})[0]
+      resolved = await resolveCustomAnswer(ctx, judge, text, boundedTable(table, text), request.signal, judgeEffort)
     } catch (error) {
       logLine(`resolveCustom: ERROR ${String(error?.message ?? error)}`)
     }
@@ -954,6 +970,6 @@ export {
   apply, inject, name,
   // Pure helpers, exported for tests (no harness state required).
   activeEfforts, boundedTable, cleanText, deterministicMatch, effortFromText,
-  extractJson, extremePick, hasExplicitModelChoice, highestEffort, lowestEffort,
-  priceSuffix, summarizeTask, uniqueChoiceLabel, withAgentOptions,
+  extractJson, extremePick, hasExplicitModelChoice, highestEffort, llmText,
+  lowestEffort, priceSuffix, summarizeTask, uniqueChoiceLabel, withAgentOptions,
 }
