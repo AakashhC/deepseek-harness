@@ -1,0 +1,23 @@
+# The dsh-spawn-model-choice bundle patch: one insert over the composed
+# profile. The row wraps `ctx.subagents.start` / `startContinuable` to ask the
+# human which model + reasoning effort a spawned subagent should use.
+#
+# What it does:
+#  - Intercepts every spawn without explicit `agentOptions` (and, when
+#    `askWhenExplicit` is true, every spawn) and presents a choice dialogue
+#    through `ctx.userQuestions`. The menu is built dynamically from the
+#    harness's configured providers/models (ctx.llm), the settings document
+#    (yaml-parsed `llm-pi-ai` + `llm-deepseek` sections), and the pi-ai
+#    catalog (`@earendil-works/pi-ai/providers/all`) for pricing/efforts.
+#  - Offers three tiers (Balanced / Correctness / Cost) plus a small curated
+#    manual list; free-text answers are resolved via a parent-model `llmJson`
+#    call with one bounded retry. Fail-open: any error/abort/absent user lets
+#    the spawn proceed untouched.
+#
+# Config is optional and documented in README.md — keys: enabled,
+# askForSpawn, parentModelRecommendation, askWhenExplicit, maxManualOptions,
+# logFile. All have defaults; omitting `config` keeps the defaults.
+
+- insert:
+    - id: spawn-model-choice
+      name: ./src/spawn-model-choice.mjs
