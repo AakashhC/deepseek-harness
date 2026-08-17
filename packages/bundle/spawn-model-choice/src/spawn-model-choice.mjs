@@ -66,23 +66,27 @@
  */
 
 const name = 'spawn-model-choice'
-const inject = ['subagents', 'userQuestions', 'settings', 'llm', 'agentDefaultModel']
+const inject = ['subagents', 'userQuestions', 'settings', 'llm', 'agentDefaultModel', 'agents']
 import { appendFile, readFile, stat, unlink } from 'node:fs/promises'
+import z from '@deepseek-ai/schemastery'
 
 /** Local diagnostic log. The LOCAL profile defaults to /tmp (single-user
  *  machine, sanitized lines); the upstream bundle defaults to OFF and only
- *  writes when `logFile` is configured. */
+ *  writes when `logFile` is configured. The destination is captured at CALL
+ *  time so a later application's reconfiguration can never redirect a line
+ *  already scheduled against the previous destination. */
 let LOG_FILE = null
 
 /** Append one line to the plugin log (async, never throws, never blocks; rotates at 1MB). */
 function logLine(line) {
-  if (!LOG_FILE) return
+  const destination = LOG_FILE
+  if (!destination) return
   ;(async () => {
     try {
-      const { size } = await stat(LOG_FILE)
-      if (size > 1024 * 1024) await unlink(LOG_FILE).catch(() => {})
+      const { size } = await stat(destination)
+      if (size > 1024 * 1024) await unlink(destination).catch(() => {})
     } catch { /* first write */ }
-    await appendFile(LOG_FILE, `${new Date().toISOString()} ${line}\n`)
+    await appendFile(destination, `${new Date().toISOString()} ${line}\n`)
   })().catch(() => {})
 }
 
@@ -96,7 +100,29 @@ const DEFAULT_CONFIG = {
   recommender: undefined,
   logFile: undefined,
   logUserInput: false,
+  // Providers whose child agents are controlled by the harness model
+  // selection. External backends (acp, codex, claude-code, dsh-sdk) run
+  // children with their OWN model/tools — a chooser there would be a lie.
+  supportedSubagentProviders: ['spawn', 'fork'],
 }
+
+export const Config = z.object({
+  enabled: z.boolean().default(true),
+  askForSpawn: z.boolean().default(true),
+  parentModelRecommendation: z.boolean().default(true),
+  askWhenExplicit: z.boolean().default(false),
+  maxManualOptions: z.number().default(1), // 0-10
+  qualityRank: z.dict(z.number()).default({}),
+  recommender: z.object({
+    provider: z.string().required(),
+    model: z.string().required(),
+    reasoningEffort: z.string(),
+  }).default(null),
+  logFile: z.union([z.string(), z.const(null)]).default(null),
+  logUserInput: z.boolean().default(false),
+  supportedSubagentProviders: z.array(z.string()).default(['spawn', 'fork']),
+})
+
 
 /* ------------------------------------------------------------------ *
  * Dynamic model catalog: harness routes + authoritative effort data
@@ -156,12 +182,13 @@ function settingsEfforts(declared, modelId) {
   if (!declared) return undefined
   for (const m of declared.models ?? []) {
     if (m.id === modelId && m.reasoningEfforts) {
-      // Keep every declared level, including empty-wire ones (the pi-ai
-      // format allows `off:` with an empty wire value). Levels are never
-      // injected raw — activeEfforts excludes 'off' and validateCandidate
-      // guards the final request — so a preserved 'off' is safe.
+      // Keep EVERY declared level, including empty-wire ones (`off:` in YAML
+      // parses as null — an explicitly supported level must not disappear).
+      // Levels are never injected raw — activeEfforts excludes 'off' and
+      // validateCandidate guards the final request — so a preserved 'off'
+      // is safe.
       return Object.entries(m.reasoningEfforts)
-        .filter(([, wire]) => wire !== null && wire !== undefined)
+        .filter(([, wire]) => wire !== undefined)
         .map(([level]) => level)
     }
   }
@@ -607,20 +634,22 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
       ?? { provider: defaultModel.provider, model: defaultModel.model, name: defaultModel.model, efforts: [], cost: UNKNOWN_COST })
     : null
 
-  // Correctness: top quality rank when any entry is ranked, else the
-  // highest-priced route. The criterion is stated in the description copy.
+  // Correctness: ONLY an explicit quality authority (qualityRank). Price is
+  // never a quality signal — with no ranked entry the tier is omitted, and a
+  // ranked model stays eligible regardless of whether its adapter exposes
+  // selectable reasoning efforts.
   const rankOf = (entry) => cfg.qualityRank?.[`${entry.provider}/${entry.model}`]
   let correctness = null
-  let correctnessBy = 'price'
   const ranked = [...table.values()]
-    .filter((e) => activeEfforts(e).length > 0 && rankOf(e) !== undefined)
+    .filter((e) => rankOf(e) !== undefined)
   if (ranked.length > 0) {
     correctness = ranked.reduce((a, b) => (rankOf(b) > rankOf(a) ? b : a))
-    correctnessBy = 'rank'
-  } else {
-    correctness = extremePick(table, 'max')
   }
-  const cost = extremePick(table, 'min')
+  // Cost: the CHEAPEST priced model, whether or not it exposes reasoning
+  // controls (a model-default effort is still a valid Cost choice).
+  const cost = [...table.values()]
+    .filter((e) => e.cost !== null)
+    .reduce((best, e) => (best === undefined || e.cost < best.cost ? e : best), undefined)
   if (!balanced && !correctness && !cost) return undefined
 
   // Recommended tier: the PARENT model's judgment of task complexity. The
@@ -656,17 +685,12 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
   if (correctness) {
     const eff = highestEffort(correctness)
     const rank = rankOf(correctness)
-    // The label never implies an empirical quality judgment the plugin has
-    // not made: "Correctness" only when a qualityRank exists; otherwise the
-    // tier names its actual criterion — the deepest effort — with the price
-    // shown as an estimate, never as a quality claim.
-    const tierLabel = correctnessBy === 'rank' ? 'Correctness' : 'Maximum effort'
+    // Present ONLY when an explicit quality authority exists — the tier is
+    // never a price-based stand-in for quality.
     tiers.push({
       key: 'correctness',
-      label: registerChoice(choiceMap, tierLabel, correctness.provider, correctness.model, eff),
-      description: correctnessBy === 'rank'
-        ? `Top quality rank (${rank}) — ${correctness.name} at ${eff}${priceSuffix(correctness)}`
-        : `Deepest reasoning — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
+      label: registerChoice(choiceMap, 'Correctness', correctness.provider, correctness.model, eff),
+      description: `Top quality rank (${rank}) — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
       group: 'Tiers',
     })
   }
@@ -675,18 +699,17 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     tiers.push({
       key: 'cost',
       label: registerChoice(choiceMap, 'Cost', cost.provider, cost.model, eff),
-      description: `Lowest estimated price — ${cost.name} at ${eff}${priceSuffix(cost)}`,
+      description: `Lowest estimated price — ${cost.name} at ${eff ?? 'model default'}${priceSuffix(cost)}`,
       group: 'Tiers',
     })
   }
 
   // The parent-model-chosen tier is tagged (Recommended) and moved first —
-  // ONLY when a judgment actually ran (a verdict must never be asserted
-  // without one: disabled recommendation, no task, no judge, or a failed
-  // classify leaves every tier untagged). The rationale reads as advice.
+  // ONLY when a judgment actually ran AND the judged tier exists (a "hard"
+  // verdict with no Correctness tier must not land the tag on another tier).
   if (judged) {
     const rationale = { correctness: 'hard', cost: 'simple', balanced: 'medium' }[recommended] ?? 'medium'
-    const recommendedTier = tiers.find((t) => t.key === recommended) ?? tiers[0]
+    const recommendedTier = tiers.find((t) => t.key === recommended)
     if (recommendedTier) {
       const plain = recommendedTier.label
       const tagged = `${plain} (Recommended)`
@@ -815,10 +838,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
         header: 'Subagent model',
         question: `Choose the model and reasoning effort for “${cleanText(label)}”.`,
         detail: `Task: ${summarizeTask(rawTask) || 'no task description.'}\n`
-          + `Default: ${balanced
-            ? `${balanced.name} at ${defaultModel.reasoningEffort ?? 'model default'}`
-              + `${priceSuffix(balanced)}`
-            : 'the configured default model'} `
+          + `Default: ${balanced ? `${balanced.name} at ${defaultModel.reasoningEffort ?? 'model default'}${priceSuffix(balanced)}` : 'the configured default model'} `
           + '— skipping or dismissing keeps it. You can also type a model name and effort.\n'
           + 'Prices are per-1M blended input/output estimates.',
         options,
@@ -848,39 +868,51 @@ async function classifyTask(ctx, cfg, judge, table, task, signal) {
   let text = ''
   try {
     text = await llmText(ctx, route, [await pluginUserMessage(
-      'Classify the complexity of this delegated task. Reply with exactly one word: '
-        + 'simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
+      'Classify the complexity of this delegated task. Reply with exactly one word: simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
     )], signal, { effort, maxTokens: 256 })
   } catch (error) {
     logLine(`classify: call failed ${String(error?.message ?? error)}`)
     throw error
   }
-  const t = text.toLowerCase()
-  const verdict = /\bhard\b/.test(t) ? 'correctness' : /\bsimple\b/.test(t) ? 'cost' : 'balanced'
-  logLine(`classify: judged -> ${verdict}`)
-  return verdict
+  // Exact normalized enum only: a permissive match could assert a verdict
+  // the model never gave. An invalid reply throws -> judged stays false ->
+  // no tier is tagged (fail-open, no fabricated recommendation).
+  const verdict = text.trim().toLowerCase()
+  if (verdict !== 'simple' && verdict !== 'medium' && verdict !== 'hard') {
+    throw new Error(`invalid classifier response: ${JSON.stringify(verdict)}`)
+  }
+  const tier = verdict === 'hard' ? 'correctness' : verdict === 'simple' ? 'cost' : 'balanced'
+  logLine(`classify: judged -> ${tier}`)
+  return tier
 }
 
-/** Inject the chosen model into a spawn request (never mutates the input). */
+/**
+ * Inject the chosen model into a spawn request (never mutates the input).
+ * The route rides `agentOptions` (works on every harness); the canonical
+ * selection — provider/model/effort — also rides the `modelSelection`
+ * request field, which the harness (after the upstream change) installs on
+ * the child before its first prompt assembly. Unknown request fields are
+ * harmless on harnesses without that support.
+ */
 function withAgentOptions(request, chosen) {
   if (!chosen || !chosen.provider || !chosen.model) return request
   const original = request.agentOptions ?? {}
-  const { reasoningEffort: previousEffort, ...rest } = original
-  const sameRoute = original.provider === chosen.provider && original.model === chosen.model
+  const { reasoningEffort: _oldEffort, ...rest } = original
   return {
     ...request,
     agentOptions: {
       ...rest,
       provider: chosen.provider,
       model: chosen.model,
-      // A chosen effort always wins. Without one, "use that model's default":
-      // the spawn's previous explicit effort survives ONLY when the route is
-      // unchanged — a stale effort from another model must never ride along.
-      ...(chosen.effort
-        ? { reasoningEffort: chosen.effort }
-        : sameRoute && previousEffort !== undefined
-          ? { reasoningEffort: previousEffort }
-          : {}),
+      // No chosen effort means "use that model's default": the old explicit
+      // effort is NEVER carried over — it belongs to a previous selection
+      // and must not silently survive a "model default" choice.
+      ...(chosen.effort !== undefined ? { reasoningEffort: chosen.effort } : {}),
+    },
+    modelSelection: {
+      provider: chosen.provider,
+      model: chosen.model,
+      ...(chosen.effort !== undefined ? { reasoningEffort: chosen.effort } : {}),
     },
   }
 }
@@ -909,8 +941,7 @@ async function validateCandidate(ctx, candidate, signal) {
     }, signal)
     return true
   } catch (error) {
-    logLine(`validateCandidate: rejected ${options.provider}/${options.model}`
-      + `@${options.reasoningEffort ?? 'default'}: ${String(error?.message ?? error)}`)
+    logLine(`validateCandidate: rejected ${options.provider}/${options.model}@${options.reasoningEffort ?? 'default'}: ${String(error?.message ?? error)}`)
     return false
   }
 }
@@ -934,27 +965,20 @@ function normalizeConfig(config) {
   cfg.qualityRank = qualityRank
   const rec = cfg.recommender
   cfg.recommender = (rec && typeof rec.provider === 'string' && typeof rec.model === 'string')
-    ? {
-        provider: rec.provider,
-        model: rec.model,
-        ...(typeof rec.reasoningEffort === 'string' ? { reasoningEffort: rec.reasoningEffort } : {}),
-      }
+    ? { provider: rec.provider, model: rec.model, ...(typeof rec.reasoningEffort === 'string' ? { reasoningEffort: rec.reasoningEffort } : {}) }
     : undefined
   cfg.logFile = (typeof cfg.logFile === 'string' && cfg.logFile.length > 0) ? cfg.logFile : undefined
   cfg.logUserInput = cfg.logUserInput === true
+  const providers = Array.isArray(cfg.supportedSubagentProviders)
+    ? cfg.supportedSubagentProviders.filter((p) => typeof p === 'string' && p.length > 0)
+    : []
+  cfg.supportedSubagentProviders = providers.length > 0 ? providers : DEFAULT_CONFIG.supportedSubagentProviders
   return cfg
 }
 
 function apply(ctx, config = {}) {
   const cfg = normalizeConfig(config)
-  // Application-local logging: this application's destination is restored to
-  // the previous one when the effect disposes, so a reload's config never
-  // leaks into the next application.
-  const previousLogFile = LOG_FILE
-  if (cfg.logFile !== undefined) LOG_FILE = cfg.logFile
-  logLine(`apply: mounting enabled=${cfg.enabled} askWhenExplicit=${cfg.askWhenExplicit} pid=${process.pid}`)
   if (!cfg.enabled) return
-
   const subagents = ctx.subagents
   if (!subagents) {
     logLine('apply: FATAL no subagents service')
@@ -964,6 +988,12 @@ function apply(ctx, config = {}) {
     logLine('apply: already wrapped (idempotent); skipping')
     return
   }
+  // Application-local logging: only the INSTALLING application touches the
+  // destination (early-return paths above never do), and the effect disposer
+  // restores the previous one on unload so a reload's config never leaks.
+  const previousLogFile = LOG_FILE
+  if (cfg.logFile !== undefined) LOG_FILE = cfg.logFile
+  logLine(`apply: mounting enabled=${cfg.enabled} askWhenExplicit=${cfg.askWhenExplicit} pid=${process.pid}`)
 
   const originalStart = subagents.start
   const originalStartContinuable = subagents.startContinuable
@@ -1010,6 +1040,24 @@ function apply(ctx, config = {}) {
     if (namespace === 'llm-pi-ai' || namespace === 'llm-deepseek') invalidateTable()
   })
 
+  /** Await the shared table build, but stop waiting the moment the spawn aborts. */
+  const waitForTable = async (signal) => {
+    const build = getTable()
+    if (!signal) return build
+    if (signal.aborted) throw signal.reason ?? new Error('spawn aborted')
+    let removeAbortListener = () => {}
+    const aborted = new Promise((_, reject) => {
+      const onAbort = () => reject(signal.reason ?? new Error('spawn aborted'))
+      signal.addEventListener('abort', onAbort, { once: true })
+      removeAbortListener = () => signal.removeEventListener('abort', onAbort)
+    })
+    try {
+      return await Promise.race([build, aborted])
+    } finally {
+      removeAbortListener()
+    }
+  }
+
   /** True when the spawning agent is a delegated (non-root) child. */
   const isNestedSpawn = (parent) => {
     try {
@@ -1040,8 +1088,8 @@ function apply(ctx, config = {}) {
         return request
       }
       if (!cfg.askForSpawn) return request
-      logLine(`intercept: asking label=${labelLog}`)
-      const table = await getTable()
+      logLine(`intercept: asking label=${labelLog} provider=${view.subagentProvider ?? '?'}`)
+      const table = await waitForTable(signal)
       const defaultModel = defaultSelection(ctx)
       const chosen = await askModel(ctx, cfg, requestView, table, defaultModel)
       logLine(`intercept: ask result=${JSON.stringify(chosen)} label=${labelLog}`)
@@ -1073,7 +1121,14 @@ function apply(ctx, config = {}) {
     let wrappedStartContinuable
     if (typeof originalStart === 'function') {
       wrappedStart = async (provider, request) => {
-        return originalStart.call(subagents, provider, await intercept(request))
+        // External backends (acp, codex, claude-code, dsh-sdk) run children
+        // with their OWN model/tools — a chooser there would be a lie. Only
+        // the configured providers whose children honour the harness model
+        // selection are intercepted.
+        if (!cfg.supportedSubagentProviders.includes(provider)) {
+          return originalStart.call(subagents, provider, request)
+        }
+        return originalStart.call(subagents, provider, await intercept(request, { subagentProvider: provider }))
       }
       subagents.start = wrappedStart
       logLine('apply: wrapped subagents.start')
@@ -1082,7 +1137,14 @@ function apply(ctx, config = {}) {
     }
     if (typeof originalStartContinuable === 'function') {
       wrappedStartContinuable = async (spec) => {
-        const request = await intercept(spec.request, { label: spec.label, signal: spec.signal })
+        if (!cfg.supportedSubagentProviders.includes(spec.provider)) {
+          return originalStartContinuable.call(subagents, spec)
+        }
+        const request = await intercept(spec.request, {
+          label: spec.label,
+          signal: spec.signal,
+          subagentProvider: spec.provider,
+        })
         return originalStartContinuable.call(subagents, request === spec.request ? spec : { ...spec, request })
       }
       subagents.startContinuable = wrappedStartContinuable
@@ -1107,18 +1169,13 @@ function apply(ctx, config = {}) {
     }
   }
 
-  if (typeof ctx.effect === 'function') {
-    try {
-      ctx.effect(install, 'spawn-model-choice.install()')
-      return
-    } catch (error) {
-      logLine(`apply: effect install failed ${String(error?.message ?? error)}`)
-    }
-  }
-  // Fallback for hosts without ctx.effect: install directly (documented).
-  const disposer = install()
-  if (typeof disposer === 'function') {
-    try { ctx.on?.('dispose', disposer) } catch { /* best-effort */ }
+  // Cordis lifecycle: the effect disposer is the mechanism that runs on
+  // unload/HMR. Current harnesses always provide ctx.effect — there is no
+  // fallback path.
+  try {
+    ctx.effect(install, 'spawn-model-choice.install()')
+  } catch (error) {
+    logLine(`apply: effect install failed ${String(error?.message ?? error)}`)
   }
 }
 

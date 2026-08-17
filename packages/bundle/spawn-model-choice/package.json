@@ -39,6 +39,7 @@
     }
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "link:../../../vendor/schemastery",
     "@earendil-works/pi-ai": "^0.82.1",
     "yaml": "^2.9.0"
   },

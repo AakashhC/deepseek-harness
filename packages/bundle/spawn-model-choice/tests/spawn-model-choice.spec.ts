@@ -6,6 +6,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   apply,
+  Config,
+  inject,
   extractJson,
   withAgentOptions,
   cleanText,
@@ -85,6 +87,7 @@ describe('spawn-model-choice helpers', () => {
       const out = withAgentOptions(request, chosen)
       expect(out.agentOptions.reasoningEffort).toBeUndefined()
       expect(out.agentOptions.provider).toBe('new-p')
+      expect(out.modelSelection).toEqual({ provider: 'new-p', model: 'new-m' })
     })
 
     it('omits reasoningEffort when neither the choice nor the original had one', () => {
@@ -180,18 +183,18 @@ describe('spawn-model-choice helpers', () => {
         nil: null as unknown as string,
       }
 
-      // Replicate the plugin's merge logic verbatim.
+      // Replicate the plugin's merge logic verbatim (round-9: keeps null-wire levels).
       let efforts = [...catalogEfforts]
       const declared = { models: [{ id: 'test-model', reasoningEfforts: settingsReasoningEfforts }] }
       for (const m of declared.models ?? []) {
         if (m.id === 'test-model' && (m as { reasoningEfforts?: Record<string, string | null> }).reasoningEfforts) {
           efforts = Object.entries((m as { reasoningEfforts: Record<string, string | null> }).reasoningEfforts)
-            .filter(([, wire]) => wire !== null && wire !== undefined && wire !== '')
+            .filter(([, wire]) => wire !== undefined)
             .map(([level]) => level)
         }
       }
 
-      expect(efforts).toEqual(['zen', 'max'])
+      expect(efforts).toEqual(['zen', 'max', 'empty', 'nil'])
       expect(efforts).not.toEqual(catalogEfforts)
     })
   })
@@ -332,7 +335,9 @@ describe('spawn-model-choice helpers', () => {
   describe('deterministicMatch + effortFromText', () => {
     type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
     const table = new Map<string, Row>([
-      ['provA/model-a', { provider: 'provA', model: 'model-a', name: 'Model A', efforts: ['low', 'medium', 'xhigh'], cost: 5, priced: true }],
+      ['provA/model-a',
+        { provider: 'provA', model: 'model-a', name: 'Model A',
+          efforts: ['low', 'medium', 'xhigh'], cost: 5, priced: true }],
       ['provB/model-b', { provider: 'provB', model: 'model-b', name: 'Model B', efforts: ['low', 'max'], cost: 10, priced: true }],
       ['provC/unique-model', { provider: 'provC', model: 'unique-model', name: 'Unique', efforts: ['low', 'high'], cost: 1, priced: true }],
     ])
@@ -519,14 +524,35 @@ describe('spawn-model-choice helpers', () => {
       expect(out.agentOptions.reasoningEffort).toBeUndefined()
       expect(out.agentOptions.provider).toBe('new')
       expect(out.agentOptions.maxTokens).toBe(123)
+      expect(out.modelSelection).toEqual({ provider: 'new', model: 'new-model' })
     })
 
-    it('withAgentOptions preserves an explicit effort only on the same route', () => {
+    it('withAgentOptions never preserves effort even on same route (model default)', () => {
       const out = withAgentOptions(
         { agentOptions: { provider: 'p', model: 'm', reasoningEffort: 'high' } },
         { provider: 'p', model: 'm', effort: undefined },
       )
+      expect(out.agentOptions.reasoningEffort).toBeUndefined()
+      expect(out.modelSelection).toEqual({ provider: 'p', model: 'm' })
+    })
+
+    it('withAgentOptions with effort sets reasoningEffort and modelSelection', () => {
+      const out = withAgentOptions(
+        { label: 'x', agentOptions: { provider: 'old', model: 'old-m', reasoningEffort: 'low' }, prompt: [] },
+        { provider: 'p', model: 'm', effort: 'high' },
+      )
       expect(out.agentOptions.reasoningEffort).toBe('high')
+      expect(out.modelSelection).toEqual({ provider: 'p', model: 'm', reasoningEffort: 'high' })
+    })
+
+    it('withAgentOptions without effort omits reasoningEffort in modelSelection', () => {
+      const out = withAgentOptions(
+        { label: 'x', prompt: [] },
+        { provider: 'p', model: 'm', effort: undefined },
+      )
+      expect(out.agentOptions.reasoningEffort).toBeUndefined()
+      expect(out.modelSelection).toEqual({ provider: 'p', model: 'm' })
+      expect(out.modelSelection).not.toHaveProperty('reasoningEffort')
     })
 
     it('normalizeConfig clamps and validates user config', () => {
@@ -569,7 +595,9 @@ describe('spawn-model-choice helpers', () => {
     it('deterministicMatch resolves an embedded model name with effort words', () => {
       type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
       const table = new Map<string, Row>()
-      table.set('p/deepseek-v4-flash', { provider: 'p', model: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', efforts: ['low', 'high'], cost: 1, priced: true })
+      table.set('p/deepseek-v4-flash',
+        { provider: 'p', model: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash',
+          efforts: ['low', 'high'], cost: 1, priced: true })
       table.set('p/gpt-5.5', { provider: 'p', model: 'gpt-5.5', name: 'GPT-5.5 via AI21', efforts: ['low', 'high'], cost: 2, priced: true })
       expect(deterministicMatch(table as never, 'DeepSeek V4 Flash at high effort')?.model).toBe('deepseek-v4-flash')
       // Effort words are not model identifiers: "max" must not match by itself.
@@ -612,4 +640,125 @@ describe('spawn-model-choice helpers', () => {
       expect(subagents.start).toBe(originalStart)
     })
   })
+
+  describe('round-9 deltas', () => {
+    it('inject includes agents', () => {
+      expect(inject).toContain('agents')
+      expect(inject).toEqual(expect.arrayContaining(['subagents', 'userQuestions', 'settings',
+        'llm', 'agentDefaultModel', 'agents']))
+    })
+
+    it('Config export is a Schemastery schema with required keys', () => {
+      // Schemastery schemas are callable Schema objects — the in-repo
+      // convention (tool-subagent, headless) exports `Config` the same way.
+      expect(Config).toBeDefined()
+      expect(typeof Config).toBe('function')
+    })
+
+    it('normalizeConfig validates supportedSubagentProviders', () => {
+      expect(normalizeConfig({ supportedSubagentProviders: ['spawn'] })
+        .supportedSubagentProviders).toEqual(['spawn'])
+      expect(normalizeConfig({ supportedSubagentProviders: [] })
+        .supportedSubagentProviders).toEqual(['spawn', 'fork'])
+      expect(normalizeConfig({ supportedSubagentProviders: ['', 'fork'] })
+        .supportedSubagentProviders).toEqual(['fork'])
+      expect(normalizeConfig({ supportedSubagentProviders: 'bad' as never })
+        .supportedSubagentProviders).toEqual(['spawn', 'fork'])
+      expect(normalizeConfig({}).supportedSubagentProviders).toEqual(['spawn', 'fork'])
+    })
+
+    it('Cost tier picks cheapest priced model regardless of efforts', () => {
+      type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
+      const table = new Map<string, Row>([
+        ['p/cheap-no-effort', { provider: 'p', model: 'cheap-no-effort',
+          name: 'Cheap No Effort', efforts: [], cost: 1, priced: true }],
+        ['p/expensive', { provider: 'p', model: 'expensive',
+          name: 'Expensive', efforts: ['low'], cost: 100, priced: true }],
+      ])
+      const cheapest = [...table.values()].filter(e => e.cost !== null)
+        .reduce((best, e) => (best === undefined || e.cost < best.cost ? e : best),
+          undefined as never)
+      expect(cheapest?.model).toBe('cheap-no-effort')
+      const oldCheapest = [...table.values()]
+        .filter(e => e.cost !== null && (e.efforts ?? []).filter(x => x !== 'off').length > 0)
+        .reduce((a, b) => (a.cost < b.cost ? a : b), [...table.values()][1] as never)
+      expect(oldCheapest.model).not.toBe('cheap-no-effort')
+    })
+
+    it('apply bypasses interception for providers outside supportedSubagentProviders', async () => {
+      let askCalls = 0
+      let originalReceived: unknown
+      const originalStart = async (_provider: string, req: unknown) => {
+        originalReceived = req
+        return 'ok'
+      }
+      const originalContinuable = async (spec: { provider: string; request: unknown }) => {
+        originalReceived = spec.request
+        return 'ok-continuable'
+      }
+      let disposer: (() => void) | undefined
+      const subagents: Record<string, unknown> = { start: originalStart,
+        startContinuable: originalContinuable }
+      const ctx: Record<string, unknown> = {
+        effect: (fn: () => (() => void) | undefined) => { disposer = fn() },
+        on: () => () => {},
+        subagents,
+        agents: { roots: () => [] },
+        llm: {
+          listProviders: () => [],
+          listModels: async () => [],
+          resolveModelInfo: async () => ({ reasoning: { efforts: [] } }),
+          resolveCallConfig: async (c: unknown) => c,
+          stream: () => (async function* () {
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          }()),
+        },
+        settings: { documentPath: undefined },
+        agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+        userQuestions: { ask: async () => {
+          askCalls += 1
+          return { answers: [{ id: 'spawn-model-choice', selected: [] }] }
+        } },
+      }
+      apply(ctx as never, { enabled: true, supportedSubagentProviders: ['spawn'] })
+      const wrappedStart = subagents.start as (p: string, r: unknown) => Promise<unknown>
+      const req = { label: 'test', prompt: [{ type: 'text', text: 'hello' }], parent: {} }
+      askCalls = 0
+      await wrappedStart('codex', req)
+      expect(askCalls).toBe(0)
+      expect(originalReceived).toBe(req)
+      askCalls = 0
+      await wrappedStart('spawn', req)
+      expect(askCalls).toBe(1)
+      disposer?.()
+      let ask2 = 0
+      const ctx2: Record<string, unknown> = {
+        effect: (fn: () => (() => void) | undefined) => { disposer = fn() },
+        on: () => () => {},
+        subagents: { start: originalStart, startContinuable: originalContinuable },
+        agents: { roots: () => [] },
+        llm: {
+          listProviders: () => [],
+          listModels: async () => [],
+          resolveModelInfo: async () => ({ reasoning: { efforts: [] } }),
+          resolveCallConfig: async (c: unknown) => c,
+          stream: () => (async function* () {
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          }()),
+        },
+        settings: {},
+        agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+        userQuestions: { ask: async () => { ask2 += 1; return { answers: [] } } },
+      }
+      apply(ctx2 as never, { enabled: true, supportedSubagentProviders: ['fork'] })
+      const wrappedCont = (ctx2.subagents as Record<string, unknown>)
+        .startContinuable as (s: unknown) => Promise<unknown>
+      await wrappedCont({ provider: 'codex', label: 'x', request: req, signal: undefined })
+      expect(ask2).toBe(0)
+      await wrappedCont({ provider: 'fork', label: 'x', request: req, signal: undefined })
+      expect(ask2).toBe(1)
+      disposer?.()
+    })
+  })
+
 })
