@@ -105,6 +105,7 @@ export {
   applyChildComposition,
   captureDelegatedPolicyOverrides,
   childSessionMeta,
+  inheritedAgentRoute,
   resolveChildAgentOptions,
   resolveChildDepth,
   SubagentDepthError,

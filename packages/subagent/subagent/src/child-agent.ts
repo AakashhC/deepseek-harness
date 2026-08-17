@@ -57,11 +57,38 @@ export function resolveChildDepth(parent: Agent, maxDepth: number | undefined): 
 }
 
 /**
- * Resolve the child's `AgentOptions`: the parent's provider/model/maxTokens
- * route unless the request overrides it, stamped with the child's own
- * delegation depth.
+ * The parent's inherited agent route: provider/model prefer the parent's live
+ * request header when one exists, else the frozen create-time options.
+ * `maxTokens` is carried only from `parent.options` — the header has no
+ * maxTokens field. Extracted so the descriptor snapshot and child creation
+ * share one precedence chain.
+ * @param parent - the delegating parent whose live/header route is read.
+ * @returns provider/model/maxTokens with the live-header-then-options fallback.
+ */
+export function inheritedAgentRoute(parent: Agent): {
+  provider?: string
+  model?: string
+  maxTokens?: number
+} {
+  const live = parent.session.requestHeader()?.config
+  const provider = live?.provider ?? parent.options.provider
+  const model = live?.model ?? parent.options.model
+  const maxTokens = parent.options.maxTokens
+  return {
+    ...provider !== undefined ? { provider } : {},
+    ...model !== undefined ? { model } : {},
+    ...maxTokens !== undefined ? { maxTokens } : {},
+  }
+}
+
+/**
+ * Resolve the child's `AgentOptions`: per-field, `requested` wins, else the
+ * parent's live route from `parent.session.requestHeader()?.config`
+ * (`provider`/`model`), else `parent.options`; `maxTokens` is inherited only
+ * from `parent.options`. The result is stamped with the child's delegation
+ * depth.
  * @param parent - the delegating parent whose route the child inherits.
- * @param requested - per-child overrides, if any.
+ * @param requested - per-child overrides, if any (`provider`/`model`/`maxTokens`).
  * @param childDepth - the resolved delegation depth to stamp.
  * @returns the resolved options for `ctx.agents.create()`.
  */
@@ -70,13 +97,9 @@ export function resolveChildAgentOptions(
   requested: AgentOptions | undefined,
   childDepth: number,
 ): AgentOptions {
-  const parentProvider = parent.options.provider
-  const parentModel = parent.options.model
-  const parentMaxTokens = parent.options.maxTokens
+  const inherited = inheritedAgentRoute(parent)
   return {
-    ...parentProvider !== undefined ? { provider: parentProvider } : {},
-    ...parentModel !== undefined ? { model: parentModel } : {},
-    ...parentMaxTokens !== undefined ? { maxTokens: parentMaxTokens } : {},
+    ...inherited,
     ...requested,
     subagentDepth: childDepth,
   }

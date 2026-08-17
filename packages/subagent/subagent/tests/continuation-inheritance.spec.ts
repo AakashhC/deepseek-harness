@@ -24,6 +24,8 @@ import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import ApprovalService, { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import SubagentRuntime from '../src/index.ts'
+import { inheritedAgentRoute, resolveChildAgentOptions } from '../src/child-agent.ts'
+import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 
 type Script = ConstructorParameters<typeof MockAdapter>[0]
 
@@ -227,5 +229,145 @@ describe('continuable policy inheritance', () => {
       { data: { mode: 'read-only', source: 'delegation' } },
     ])
     expect(effectiveSandboxMode(loaded.events)).toBe('read-only')
+  })
+})
+
+describe('continuable agent route inheritance (live header)', () => {
+  function fakeParent(
+    options: AgentOptions,
+    live: { provider?: string; model?: string } | undefined,
+  ): Agent {
+    return {
+      id: SessionId('parent-route'),
+      options,
+      session: {
+        header: { id: SessionId('parent-route') },
+        requestHeader: () => live === undefined ? undefined : { config: live as never },
+      },
+      ctx: { get: () => undefined } as unknown as Agent['ctx'],
+    } as unknown as Agent
+  }
+
+  it('child without agentOptions inherits live header provider/model over frozen options', () => {
+    const parent = fakeParent(
+      { provider: 'frozen-provider', model: 'frozen-model', maxTokens: 1024 },
+      { provider: 'live-provider', model: 'live-model' },
+    )
+    // inheritedAgentRoute is the single home for the live-header-then-options fallback
+    expect(inheritedAgentRoute(parent)).toEqual({
+      provider: 'live-provider',
+      model: 'live-model',
+      maxTokens: 1024,
+    })
+    const resolved = resolveChildAgentOptions(parent, undefined, 1)
+    expect(resolved.provider).toBe('live-provider')
+    expect(resolved.model).toBe('live-model')
+    expect(resolved.maxTokens).toBe(1024)
+    expect(resolved.subagentDepth).toBe(1)
+  })
+
+  it('explicit requested agentOptions wins over live header', () => {
+    const parent = fakeParent(
+      { provider: 'frozen-provider', model: 'frozen-model' },
+      { provider: 'live-provider', model: 'live-model' },
+    )
+    const requested: AgentOptions = { provider: 'explicit-provider', model: 'explicit-model' }
+    const resolved = resolveChildAgentOptions(parent, requested, 2)
+    expect(resolved.provider).toBe('explicit-provider')
+    expect(resolved.model).toBe('explicit-model')
+    expect(resolved.subagentDepth).toBe(2)
+    // Partial override still inherits live header for the unspecified field
+    const partial = resolveChildAgentOptions(parent, { provider: 'explicit-provider' }, 2)
+    expect(partial.provider).toBe('explicit-provider')
+    expect(partial.model).toBe('live-model')
+  })
+
+  it('falls back to frozen options when live header is absent and preserves maxTokens from options only', () => {
+    const parent = fakeParent(
+      { provider: 'frozen-provider', model: 'frozen-model', maxTokens: 2048 },
+      undefined,
+    )
+    expect(inheritedAgentRoute(parent)).toEqual({
+      provider: 'frozen-provider',
+      model: 'frozen-model',
+      maxTokens: 2048,
+    })
+    const resolved = resolveChildAgentOptions(parent, undefined, 1)
+    expect(resolved.provider).toBe('frozen-provider')
+    expect(resolved.model).toBe('frozen-model')
+    expect(resolved.maxTokens).toBe(2048)
+  })
+
+  it('live header carries provider/model into the continuable descriptor via same helper', async () => {
+    // Integration: a live parent whose log now advertises a different provider/model
+    // spawns a continuable child without explicit agentOptions — the persisted
+    // descriptor must snapshot the live header route, not the frozen options.
+    const { ctx, parent } = await setup([textResponse('child done')])
+    // Simulate user switching model on the parent session: parent.options stays
+    // frozen, but the session log's request header moves.
+    parent.session.append('request/header', {
+      header: { config: { provider: 'live-provider', model: 'live-model' } },
+      reason: 'change',
+    } as never)
+    expect(parent.options.provider).toBe('mock')
+    expect(parent.session.requestHeader()?.config.provider).toBe('live-provider')
+
+    let childAgent: Agent | undefined
+    ctx.on('agent/created', ({ agent }) => {
+      if (agent !== parent) childAgent = agent
+    })
+    const started = await ctx.subagents.startContinuable(startSpec(parent))
+    await waitNoActivation(ctx, started.childId)
+
+    if (childAgent === undefined) throw new Error('expected continuable child to be created')
+    expect(childAgent.options.provider).toBe('live-provider')
+    expect(childAgent.options.model).toBe('live-model')
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    const descriptor = loaded.events.find(event => event.type === 'subagent/descriptor') as SessionEvent<'subagent/descriptor'> | undefined
+    expect(descriptor?.data).toMatchObject({
+      provider: 'spawn',
+      mode: 'continuable',
+      agentProvider: 'live-provider',
+      agentModel: 'live-model',
+    })
+  })
+
+  it('explicit requested route still wins over live header in descriptor snapshot', async () => {
+    const { ctx, parent } = await setup([textResponse('child done')])
+    parent.session.append('request/header', {
+      header: { config: { provider: 'live-provider', model: 'live-model' } },
+      reason: 'change',
+    } as never)
+
+    const requestedProvider = 'explicit-provider'
+    const requestedModel = 'explicit-model'
+    const spec = {
+      provider: 'spawn',
+      label: 'child task',
+      request: {
+        prompt: [{ type: 'text' as const, text: 'child task' }],
+        parent,
+        agentOptions: { provider: requestedProvider, model: requestedModel },
+      },
+      signal: new AbortController().signal,
+    }
+    let childAgent: Agent | undefined
+    ctx.on('agent/created', ({ agent }) => {
+      if (agent !== parent) childAgent = agent
+    })
+    const started = await ctx.subagents.startContinuable(spec)
+    await waitNoActivation(ctx, started.childId)
+
+    if (childAgent === undefined) throw new Error('expected continuable child')
+    expect(childAgent.options.provider).toBe(requestedProvider)
+    expect(childAgent.options.model).toBe(requestedModel)
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    const descriptor = loaded.events.find(event => event.type === 'subagent/descriptor') as SessionEvent<'subagent/descriptor'> | undefined
+    expect(descriptor?.data).toMatchObject({
+      agentProvider: requestedProvider,
+      agentModel: requestedModel,
+    })
   })
 })
