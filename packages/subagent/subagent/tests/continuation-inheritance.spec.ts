@@ -37,7 +37,7 @@ afterEach(async () => {
 })
 
 /** Boot the continuable stack plus both policy services the manager consumes opportunistically. */
-async function setup(script: Script, adapter?: { providers?: readonly string[]; reasoning?: LlmModelReasoningInfo }) {
+async function setup(script: Script, adapter?: { providers?: string[]; reasoning?: LlmModelReasoningInfo }) {
   const ctx = new Context()
   contexts.push(ctx)
   await mountAgentLoopTestDependencies(ctx)
