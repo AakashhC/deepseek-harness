@@ -850,7 +850,7 @@ async function classifyTask(ctx, cfg, judge, table, task, signal) {
     text = await llmText(ctx, route, [await pluginUserMessage(
       'Classify the complexity of this delegated task. Reply with exactly one word: '
         + 'simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
-    )], signal, { effort })
+    )], signal, { effort, maxTokens: 256 })
   } catch (error) {
     logLine(`classify: call failed ${String(error?.message ?? error)}`)
     throw error
