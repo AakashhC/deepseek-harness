@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   apply,
+  classifyTask,
   Config,
   inject,
   extractJson,
@@ -758,6 +759,21 @@ describe('spawn-model-choice helpers', () => {
       await wrappedCont({ provider: 'fork', label: 'x', request: req, signal: undefined })
       expect(ask2).toBe(1)
       disposer?.()
+    })
+  })
+  describe('deterministic classifier', () => {
+    it('long tasks with hard signals classify hard', async () => {
+      const task = 'Harden the chart screen: review aria labels, audit contrast, debug reflow at 320px.'
+      const tier = await classifyTask({} as never, {} as never, {} as never, new Map() as never, task, undefined)
+      expect(tier).toBe('correctness')
+    })
+    it('short tasks without hard signals classify simple', async () => {
+      const tier = await classifyTask({} as never, {} as never, {} as never, new Map() as never, 'fix the typo in the button label', undefined)
+      expect(tier).toBe('cost')
+    })
+    it('medium tasks classify medium', async () => {
+      const tier = await classifyTask({} as never, {} as never, {} as never, new Map() as never, 'update the empty-state copy for the onboarding flow, reorder the footer actions, and adjust the secondary button alignment and the hover and focus states across the responsive breakpoints of the settings panel and the profile preferences screen, then verify the keyboard order and the reduced motion behavior at every supported viewport width', undefined)
+      expect(tier).toBe('balanced')
     })
   })
 

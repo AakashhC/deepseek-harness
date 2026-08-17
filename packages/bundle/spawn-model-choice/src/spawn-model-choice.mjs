@@ -856,33 +856,50 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
 }
 
 /**
- * One tiny LLM call: classify task difficulty -> tier. Uses the configured
- * recommender route when present, else the parent model at its LOWEST
- * declared effort (the cheapest honest judgment this menu can make).
+ * Classify task difficulty -> tier. DETERMINISTIC by default (task length +
+ * complexity signals): instant, zero cost, never flakes. An explicit
+ * `recommender` config opts into an LLM judgment at that route's lowest
+ * declared effort instead.
  */
 async function classifyTask(ctx, cfg, judge, table, task, signal) {
-  const route = (cfg.recommender?.provider && cfg.recommender?.model) ? cfg.recommender : judge
-  // Lowest REAL effort: activeEfforts excludes the 'off' level.
-  const lowest = activeEfforts(table.get(`${route.provider}/${route.model}`) ?? {})[0]
-  const effort = cfg.recommender?.reasoningEffort ?? lowest
-  let text = ''
-  try {
-    text = await llmText(ctx, route, [await pluginUserMessage(
-      'Classify the complexity of this delegated task. Reply with exactly one word: simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
-    )], signal, { effort, maxTokens: 256 })
-  } catch (error) {
-    logLine(`classify: call failed ${String(error?.message ?? error)}`)
-    throw error
+  if (cfg.recommender?.provider && cfg.recommender?.model) {
+    const route = cfg.recommender
+    // Lowest REAL effort: activeEfforts excludes the 'off' level.
+    const lowest = activeEfforts(table.get(`${route.provider}/${route.model}`) ?? {})[0]
+    const effort = cfg.recommender?.reasoningEffort ?? lowest
+    let text = ''
+    try {
+      text = await llmText(ctx, route, [await pluginUserMessage(
+        'Classify the complexity of this delegated task. Reply with exactly one word: simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
+      )], signal, { effort, maxTokens: 256 })
+    } catch (error) {
+      logLine(`classify: call failed ${String(error?.message ?? error)}`)
+      throw error
+    }
+    // Exact normalized enum only: a permissive match could assert a verdict
+    // the model never gave. An invalid reply throws -> judged stays false ->
+    // no tier is tagged (fail-open, no fabricated recommendation).
+    const verdict = text.trim().toLowerCase()
+    if (verdict !== 'simple' && verdict !== 'medium' && verdict !== 'hard') {
+      throw new Error(`invalid classifier response: ${JSON.stringify(verdict)}`)
+    }
+    const tier = verdict === 'hard' ? 'correctness' : verdict === 'simple' ? 'cost' : 'balanced'
+    logLine(`classify: judged -> ${tier}`)
+    return tier
   }
-  // Exact normalized enum only: a permissive match could assert a verdict
-  // the model never gave. An invalid reply throws -> judged stays false ->
-  // no tier is tagged (fail-open, no fabricated recommendation).
-  const verdict = text.trim().toLowerCase()
-  if (verdict !== 'simple' && verdict !== 'medium' && verdict !== 'hard') {
-    throw new Error(`invalid classifier response: ${JSON.stringify(verdict)}`)
-  }
+
+  // Deterministic heuristic: strong complexity signals or very long tasks are
+  // hard; short tasks with no hard signals are simple; everything else is
+  // medium. Honest proxy — the tag only ever reads "looks X complexity".
+  const t = task.slice(0, 2000).toLowerCase()
+  const hardSignal = /\b(review|critique|audit|harden|debug|diagnos|refactor|migrat|implement|architect|design|security|performance|concurr|integrat|complex|thread|async|schema|migration|contract)\b/.test(t)
+  const verdict = hardSignal || t.length > 900
+    ? 'hard'
+    : (!hardSignal && t.length < 200)
+      ? 'simple'
+      : 'medium'
   const tier = verdict === 'hard' ? 'correctness' : verdict === 'simple' ? 'cost' : 'balanced'
-  logLine(`classify: judged -> ${tier}`)
+  logLine(`classify: deterministic -> ${tier} (${t.length} chars)`)
   return tier
 }
 
@@ -1182,8 +1199,8 @@ function apply(ctx, config = {}) {
 export {
   apply, inject, name,
   // Pure helpers, exported for tests (no harness state required).
-  activeEfforts, boundedTable, cleanText, deterministicMatch, effortFromText,
-  extractJson, extremePick, hasExplicitModelChoice, highestEffort, llmText,
-  lowestEffort, normalizeConfig, priceSuffix, summarizeTask, uniqueChoiceLabel,
-  validateCandidate, withAgentOptions,
+  activeEfforts, boundedTable, classifyTask, cleanText, deterministicMatch,
+  effortFromText, extractJson, extremePick, hasExplicitModelChoice, highestEffort,
+  llmText, lowestEffort, normalizeConfig, priceSuffix, summarizeTask,
+  uniqueChoiceLabel, validateCandidate, withAgentOptions,
 }
