@@ -62,7 +62,9 @@
 const name = 'spawn-model-choice'
 const inject = ['subagents', 'userQuestions', 'settings', 'llm', 'agentDefaultModel']
 
-/** Bundle diagnostic log — OFF by default; enable via `logFile` config. */
+/** Local diagnostic log. The LOCAL profile defaults to /tmp (single-user
+ *  machine, sanitized lines); the upstream bundle defaults to OFF and only
+ *  writes when `logFile` is configured. */
 let LOG_FILE = null
 
 /** Append one line to the plugin log (async, never throws, never blocks; rotates at 1MB). */
@@ -322,10 +324,6 @@ function registerChoice(choiceMap, label, provider, model, effort) {
   return label
 }
 
-function decodeChoice(choiceMap, label) {
-  return choiceMap.get(label)
-}
-
 /**
  * Final label for one manual option, decided BEFORE it is registered so the
  * displayed label and the registered key can never diverge.
@@ -342,7 +340,7 @@ function hasExplicitModelChoice(agentOptions) {
   return Boolean(agentOptions?.provider || agentOptions?.model || agentOptions?.reasoningEffort)
 }
 
-/** One identified plugin-source user message (bare fallback if the module is absent). */
+/** One identified plugin-source user message (constructor, or a hand-built equivalent). */
 async function pluginUserMessage(text) {
   try {
     const { createUserMessage } = await import('@deepseek-ai/dsh-llm/message')
@@ -351,7 +349,15 @@ async function pluginUserMessage(text) {
       content: [{ type: 'text', text }],
     })
   } catch {
-    return { role: 'user', content: [{ type: 'text', text }] }
+    // The harness always ships dsh-llm, but if the module is ever absent the
+    // message must still be a VALID identified message (id/role/source), not
+    // a bare object — the message contract does not depend on the import.
+    return {
+      id: crypto.randomUUID(),
+      role: 'user',
+      source: { kind: 'plugin', plugin: name },
+      content: [{ type: 'text', text }],
+    }
   }
 }
 
@@ -479,7 +485,11 @@ function effortFromText(entry, text) {
   return undefined
 }
 
-/** A bounded LLM-interpretation shortlist: cheapest priced first, then fuzzy candidates. */
+/**
+ * A bounded LLM-interpretation shortlist: cheapest priced first, then fuzzy
+ * candidates. Returns a Map in the SAME shape as the full model table, so
+ * resolveCustomAnswer can decode a reply against it with `table.get(...)`.
+ */
 function boundedTable(table, text) {
   const entries = [...table.values()]
   const tokens = text.toLowerCase().split(/\W+/).filter((w) => w.length > 2)
@@ -490,7 +500,8 @@ function boundedTable(table, text) {
   }
   const ranked = [...fuzzy, ...entries].filter((e, i, a) => a.indexOf(e) === i)
     .sort((a, b) => (a.cost ?? Infinity) - (b.cost ?? Infinity))
-  return ranked.slice(0, 12)
+    .slice(0, 12)
+  return new Map(ranked.map((e) => [`${e.provider}/${e.model}`, e]))
 }
 
 /**
@@ -586,7 +597,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     tiers.push({
       key: 'balanced',
       label: registerChoice(choiceMap, 'Balanced', balanced.provider, balanced.model, eff),
-      description: `Configured default — ${balanced.name} at ${eff ?? 'default'}${priceSuffix(balanced)}`,
+      description: `Configured default — ${balanced.name} at ${eff ?? 'model default'}${priceSuffix(balanced)}`,
       group: 'Tiers',
     })
   }
@@ -598,7 +609,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
       label: registerChoice(choiceMap, 'Correctness', correctness.provider, correctness.model, eff),
       description: correctnessBy === 'rank'
         ? `Top quality rank (${rank}) — ${correctness.name} at ${eff}${priceSuffix(correctness)}`
-        : `Highest-priced route — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
+        : `Highest estimated price — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
       group: 'Tiers',
     })
   }
@@ -614,7 +625,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
 
   // The parent-model-chosen tier is tagged (Recommended) and moved first,
   // with its judgment visible so the tag reads as advice, not authority.
-  const rationale = { correctness: 'judged hard', cost: 'judged simple', balanced: 'judged medium' }[recommended] ?? 'judged medium'
+  const rationale = { correctness: 'judged hard', cost: 'judged simple', balanced: 'judged medium' }[recommended]
   const recommendedTier = tiers.find((t) => t.key === recommended) ?? tiers[0]
   if (recommendedTier) {
     const plain = recommendedTier.label
@@ -632,7 +643,6 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
   // at its own deepest declared effort. The final label is decided BEFORE it
   // is registered, so a displayed option can never decode to nothing.
   const manual = []
-  const seen = new Set()
   const skipEntries = new Set()
   for (const pick of [balanced, correctness, cost]) {
     if (pick) skipEntries.add(`${pick.provider}/${pick.model}`)
@@ -646,16 +656,13 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     const e = active[active.length - 1] // deepest declared effort, undefined when none
     const label = uniqueChoiceLabel(choiceMap, entry.name, entry.provider, entry.model)
     registerChoice(choiceMap, label, entry.provider, entry.model, e)
-    if (!seen.has(label)) {
-      seen.add(label)
-      manual.push({
-        label,
-        description: active.length === 0
-          ? `Uses the model's default effort${priceSuffix(entry)}`
-          : `Deepest declared effort: ${e}${priceSuffix(entry)}`,
-        group: 'More models',
-      })
-    }
+    manual.push({
+      label,
+      description: active.length === 0
+        ? `Uses the model's default effort${priceSuffix(entry)}`
+        : `Deepest declared effort: ${e}${priceSuffix(entry)}`,
+      group: 'More models',
+    })
   }
 
   const options = [...tiers, ...manual]
@@ -664,7 +671,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
   // Free text resolves DETERMINISTICALLY first; ambiguous text goes to a
   // bounded LLM interpretation. When it cannot resolve, we ask the user once
   // more; still unresolved, the spawn proceeds untouched.
-  const resolveAnswer = async (answer, askAgain) => {
+  const resolveAnswer = async (answer, isFollowUp) => {
     const item = answer.answers?.find((a) => a.id === 'spawn-model-choice')
     const picked = item?.selected?.[0]
     const customLog = item?.custom
@@ -673,17 +680,17 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     logLine(`askModel: picked=${JSON.stringify(picked)}${customLog ? ' ' + customLog : ''}`)
     if (item?.custom) {
       // Free text is the user's later, more specific input; it wins over a pick.
-      return resolveCustomText(item.custom, true, askAgain)
+      return resolveCustomText(item.custom, true, isFollowUp)
     }
     if (picked) {
-      const decoded = decodeChoice(choiceMap, picked)
+      const decoded = choiceMap.get(picked)
       if (decoded) return decoded
       return undefined
     }
     return undefined
   }
 
-  const resolveCustomText = async (customText, allowFollowUp, askAgain) => {
+  const resolveCustomText = async (customText, allowFollowUp, isFollowUp) => {
     const text = String(customText ?? '').trim()
     if (!text) return undefined
     // 1. Deterministic: exact id/name or a unique fuzzy match, with the
@@ -706,7 +713,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
       logLine(`resolveCustom: ERROR ${String(error?.message ?? error)}`)
     }
     if (resolved) return resolved
-    if (allowFollowUp && !askAgain) {
+    if (allowFollowUp && !isFollowUp) {
       // The parent model could not map the free text: ask the user again.
       try {
         const second = await ctx.userQuestions.ask({
@@ -742,11 +749,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
         id: 'spawn-model-choice',
         header: 'Subagent model',
         question: `Choose the model and reasoning effort for “${cleanText(label)}”.`,
-        detail: `Task: ${summarizeTask(rawTask) || 'no task description.'}\n`
-          + `Default: ${balanced ? `${balanced.name} at ${defaultModel.reasoningEffort ?? 'default'}${priceSuffix(balanced)}` : 'the configured default model'}. `
-          + 'You can also type a model name and effort.\n'
-          + 'Skipping or dismissing uses the configured default model.\n'
-          + 'Prices are per-1M blended input/output estimates.',
+        detail: `Task: ${summarizeTask(rawTask) || 'no task description.'}\nDefault: ${balanced ? `${balanced.name} at ${defaultModel.reasoningEffort ?? 'model default'}${priceSuffix(balanced)}` : 'the configured default model'} — skipping or dismissing keeps it. You can also type a model name and effort.\nPrices are per-1M blended input/output estimates.`,
         options,
       }],
     })
@@ -768,13 +771,14 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
  */
 async function classifyTask(ctx, cfg, judge, table, task, signal) {
   const route = (cfg.recommender?.provider && cfg.recommender?.model) ? cfg.recommender : judge
-  const lowest = table.get(`${route.provider}/${route.model}`)?.efforts?.[0]
+  // Lowest REAL effort: activeEfforts excludes the 'off' level.
+  const lowest = activeEfforts(table.get(`${route.provider}/${route.model}`) ?? {})[0]
   const effort = cfg.recommender?.reasoningEffort ?? lowest
   let text = ''
   try {
-    const classifyPrompt = 'Classify the complexity of this delegated task. '
-      + 'Reply with exactly one word: simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200)
-    text = await llmText(ctx, route, [await pluginUserMessage(classifyPrompt)], signal, { effort })
+    text = await llmText(ctx, route, [await pluginUserMessage(
+      'Classify the complexity of this delegated task. Reply with exactly one word: simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
+    )], signal, { effort })
   } catch (error) {
     logLine(`classify: call failed ${String(error?.message ?? error)}`)
     throw error

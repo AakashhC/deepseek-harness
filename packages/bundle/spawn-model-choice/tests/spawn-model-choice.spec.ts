@@ -429,14 +429,79 @@ describe('spawn-model-choice helpers', () => {
 
   describe('boundedTable caps at 12', () => {
     it('never returns more than 12 entries', () => {
-      type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
+      type Row = {
+        provider: string
+        model: string
+        name: string
+        efforts: string[]
+        cost: number | null
+        priced: boolean
+      }
       const table = new Map<string, Row>()
       for (let i = 0; i < 30; i++) {
-        table.set(`p/m${i}`, { provider: 'p', model: `m${i}`, name: `Model ${i}`, efforts: ['low'], cost: i, priced: true })
+        table.set(`p/m${i}`, {
+          provider: 'p',
+          model: `m${i}`,
+          name: `Model ${i}`,
+          efforts: ['low'],
+          cost: i,
+          priced: true,
+        })
       }
       const result = boundedTable(table as never, 'model')
-      expect(result.length).toBeLessThanOrEqual(12)
-      expect(result.length).toBe(12)
+      expect(result.size).toBeLessThanOrEqual(12)
+      expect(result.size).toBe(12)
+    })
+
+    it('returns Map keyed by provider/model and keeps fuzzy entry first', () => {
+      type Row = {
+        provider: string
+        model: string
+        name: string
+        efforts: string[]
+        cost: number | null
+        priced: boolean
+      }
+      const table = new Map<string, Row>([
+        [
+          'p/cheap-fuzzy',
+          {
+            provider: 'p',
+            model: 'cheap-fuzzy',
+            name: 'Cheap FuzzyUnique',
+            efforts: ['low'],
+            cost: 1,
+            priced: true,
+          },
+        ],
+        [
+          'p/expensive',
+          {
+            provider: 'p',
+            model: 'expensive',
+            name: 'Expensive',
+            efforts: ['low'],
+            cost: 100,
+            priced: true,
+          },
+        ],
+      ])
+      for (let i = 0; i < 20; i++) {
+        table.set(`p/m${i}`, {
+          provider: 'p',
+          model: `m${i}`,
+          name: `Model ${i}`,
+          efforts: ['low'],
+          cost: 10 + i,
+          priced: true,
+        })
+      }
+      const result = boundedTable(table as never, 'fuzzyunique')
+      expect([...result.keys()].every(k => k.includes('/'))).toBe(true)
+      expect(result.has('p/cheap-fuzzy')).toBe(true)
+      expect([...result.keys()][0]).toBe('p/cheap-fuzzy')
+      expect([...result.values()][0].model).toBe('cheap-fuzzy')
+      expect(result.get('p/cheap-fuzzy')?.name).toBe('Cheap FuzzyUnique')
     })
   })
 })
