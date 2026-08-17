@@ -26,19 +26,23 @@
 
 修改后重启 `dsh`（或 `dsh web` 服务）。不使用 `~/.dsh` 插件路径——bundle 优先从安装目录解析，其次是 profile 目录。
 
+## 范围
+
+**仅限根 spawn 选择。** Web 侧 `userQuestions` 仅对精确的实时根代理受理提问（否则 `DELEGATED_CALLER`/`CALLER_NOT_LIVE`），因此嵌套 spawn（子→孙）不会触发选择器，直接沿用其已有/默认策略。
+
 ## 功能
 
-包装 `ctx.subagents.start` / `ctx.subagents.startContinuable`（`subagent` 工具与 `run_code` 的 `tools.subagent` 都会调用的精确接入点），拦截每个未显式携带 `agentOptions` 的 spawn，通过 `ctx.userQuestions.ask` 询问人类使用哪个模型/推理力度。
+包装 `ctx.subagents.start` / `ctx.subagents.startContinuable`（`subagent` 工具与 `run_code` 的 `tools.subagent` 都会调用的精确接入点），拦截每个未显式携带模型选择的 spawn，通过 `ctx.userQuestions.ask` 询问人类使用哪个模型/推理力度。
 
 菜单完全动态构建：
 
 - 通过 `ctx.llm.listProviders()` / `ctx.llm.listModels(providerId)` 获取已配置的 providers/models；
-- 通过 `yaml` 解析设置文档（`ctx.settings.documentPath`，`llm-pi-ai.providers` + `llm-deepseek`）以及皮层 `pi-ai` 目录（`@earendil-works/pi-ai/providers/all` 的 `getBuiltinModels`，兼容 `Array` / `Map` / 普通对象，并处理 `CATALOG_ALIAS`）获取推理力度与成本；
-- 成本来自 `pi-ai` 目录（`cost.input` + `cost.output` 按每 1M 混合），仅在已定价时显示。
+- 推理力度来自权威的 `ctx.llm.resolveModelInfo()` 路由元数据（适配器首选顺序，反映合并后的设置/覆盖），回退到设置文档（`yaml` 解析 `llm-pi-ai.providers` + `llm-deepseek`）和 `pi-ai` 目录（`@earendil-works/pi-ai/providers/all` 的 `getBuiltinModels`，兼容 `Array` / `Map` / 普通对象，并处理 `CATALOG_ALIAS`）；
+- 成本来自 `pi-ai` 目录（`cost.input` + `cost.output` 按每 1M 混合），仅在已定价时显示为 ` (est. $X.XX/1M)`（混合估算，诚实定价）。
 
 设置文档中声明的 `reasoningEfforts` 对该模型是权威的——目录仅作为未声明模型的回退。设置中声明的任意层级（`"max"`、`"zen"` 等）都会被提供、展示并可被解析。
 
-人类通过 harness 自带的 `ctx.userQuestions.ask` 对话框作答。自由文本（如 `"deepseek v4 flash at high effort"`）由父模型对照实时表格解析；无法解析时会再询问一次，仍无法解析则保持 fail-open。
+人类通过 harness 自带的 `ctx.userQuestions.ask` 对话框作答。自由文本（如 `"deepseek v4 flash at high effort"`）先确定性解析（精确 id/name、唯一模糊、已声明 effort id 及 `xtra`/`deep` 等上位同义词），仅模糊文本进入有界 LLM 解释（≤12 条候选）；无法解析时会再询问一次，仍无法解析则保持 fail-open。选项按 `group` 分组（`Tiers` vs `More models`，需要 `user-questions` 选项分组变更才渲染分组标题，否则保持平铺）。
 
 ## 配置参考
 
@@ -49,9 +53,11 @@
 | `enabled` | `boolean` | `true` | 总开关。`false` 时挂载但不包装任何调用。 |
 | `askForSpawn` | `boolean` | `true` | `true` 时每次缺少显式 `agentOptions` 的 spawn 都会弹窗；`false` 时永不询问。 |
 | `parentModelRecommendation` | `boolean` | `true` | `true` 时用父模型做一次廉价的 `llmText` 分类（`simple`/`medium`/`hard`，匹配 `\bhard\b` / `\bsimple\b`），将对应档位标记为 **(Recommended)** 并置顶。`false` 时不调用 LLM。 |
-| `askWhenExplicit` | `boolean` | `false` | `false` 时已携带显式 `agentOptions` 的 spawn 不会被拦截；`true` 时也会询问。 |
+| `askWhenExplicit` | `boolean` | `false` | `false` 时已携带显式模型选择（仅 `provider`/`model`/`reasoningEffort`，`maxTokens` 等尺寸键不算）的 spawn 不会被拦截；`true` 时也会询问。 |
 | `maxManualOptions` | `number` | `3` | 在三个档位之外额外列出的非默认模型数量，按成本从低到高，每个使用其最深的已声明力度。 |
-| `logFile` | `string \| undefined` | `undefined` | 可选的调试日志文件路径。未设置时不写文件；设置后通过 `node:fs/promises` 异步追加，1MB 轮转，永不抛错、永不阻塞。 |
+| `qualityRank` | `Record<string, number>` | `{}` | 可选质量排名 —— `"provider/model": number`。有排名时 **Correctness** 档位取排名最高者，否则取最高价路由。 |
+| `recommender` | `{ provider, model, reasoningEffort? } \| undefined` | `undefined` | 分类调用的可选路由；未设置时使用父模型在其最低已声明力度上的判断。 |
+| `logFile` | `string \| undefined` | `undefined` | 可选的调试日志文件路径（bundle 默认 OFF，禁用）。设置路径后启用，通过 `node:fs/promises` 异步追加，1MB 轮转，永不抛错、永不阻塞，日志经 `cleanText` 脱敏。 |
 
 在 `profiles/<name>/cordis.patch.yml` 中覆盖示例：
 
@@ -63,19 +69,24 @@
     parentModelRecommendation: true
     askWhenExplicit: false
     maxManualOptions: 3
+    qualityRank:
+      deepseek/deepseek-chat: 10
+    recommender:
+      provider: deepseek
+      model: deepseek-chat
+      reasoningEffort: low
     # logFile: /tmp/spawn-model-choice.log
 ```
 
 ## 行为说明
 
-- **全链路 fail-open。** 任何错误、abort、无用户、缺失 `ctx.llm`/`ctx.userQuestions` 或自由文本无法解析时，spawn 按 harness 原有逻辑继续执行。`withAgentOptions` 永不原地修改输入，返回新对象。
-- **诚实定价。** 仅当 `entry.priced === true` 时显示 `priceSuffix`；`UNKNOWN_COST`（`null`）永不渲染为数字。输入/输出成本按 `(input + output) / 2` 混合（USD/1M），档位通过带 null-cost 守卫的 `extremePick` 选取；未知价格的模型永不成为档位。价格保留两位小数。
-- **动态目录。** 每次拦截时从实时 harness 状态与 `pi-ai` 目录重建 provider/model/effort/cost 列表；无硬编码。`getBuiltinModels` 从 `@earendil-works/pi-ai/providers/all` 动态导入，兼容 `Array`、`Map`、普通对象。`yaml` 动态导入并解析设置文档。
-- **三档位 + 手动列表。** `Balanced` 为配置的默认模型及其默认 `reasoningEffort`；`Correctness` 为最贵模型的最深力度；`Cost` 为最便宜模型的最低力度。父模型 verdict（`\bhard\b` → Correctness，`\bsimple\b` → Cost，否则 Balanced）将对应档位标记为 `(Recommended)` 并附带可见理由（`judged hard`/`simple`/`medium`）置顶。手动列表通过 `skipEntries` 去重排除三档位已提供的模型，并通过 `addManualOption` 在标签冲突时追加 `(provider)` 后缀，最多追加 `maxManualOptions` 个最便宜的剩余模型。
-- **自由文本 + 追问。** `llmJson` 提取返回中的首个 `{…}` JSON 对象；未找到则做**一次**有界重试，回显违规回复并提示 `"Your previous reply contained no JSON object. Reply with ONLY a JSON object…"`。`resolveCustomAnswer` 构建实时条目列表（`- provider/model (name); efforts: …`）并让父模型将自由文本映射到其中（理解同义词/缩写，effort 必须是该条目已声明的）。若无法映射，则向用户**再询问一次** `“<text>” does not match a configured model. Choose one:`；仍无法解析则放行。
-- **每问独立的 `choiceMap`。** 每次提问拥有独立的 `Map<label, choice>`，并发 spawn 永不串扰。`withAgentOptions` 在选择无 effort 时保留原有显式 `reasoningEffort`；有 effort 的选择始终胜出。
-- **诚实文案。** 对话框 `detail` 行包含 `"Skipping or dismissing uses the configured default model."`、默认基线（`<name> at <effort>` 或 `the configured default model`）以及 `"You can also type a model name and effort."` 提示。`cleanText`/`summarizeTask` 对用户来源字符串做净化（引号/换行替换、空白折叠、110 字符单词边界截断、标签 80 字符上限）。
-- **日志。** 文件日志由 `logFile` 按需开启。启用后 `logLine` 通过 `node:fs/promises` 异步追加，1MB 轮转，永不抛错或阻塞。
+- **全链路 fail-open。** 任何错误、abort、无用户、缺失 `ctx.llm`/`ctx.userQuestions`、嵌套 spawn（`DELEGATED_CALLER`/`CALLER_NOT_LIVE`）、无效/过期选择（经 `ctx.llm.resolveCallConfig` 校验）或自由文本无法解析时，spawn 按 harness 原有逻辑继续执行。`withAgentOptions` 永不原地修改输入，返回新对象。`off` 保留在原始 effort 列表中，仅在档位/注入需要真实力度时排除。
+- **诚实定价与档位语义。** 仅当 `entry.priced === true` 时显示 `priceSuffix`（` (est. $X.XX/1M)`，零成本显示 ` (est. $0.00/1M)`）；`UNKNOWN_COST`（`null`）永不渲染为数字。`Balanced` 为配置的默认模型及其已配置力度；`Correctness` 为有排名时 `qualityRank` 最高者否则最高价路由的最深力度；`Cost` 为最低估算价格的最低力度。每档描述即陈述其判定标准。未知价格模型永不成为档位。
+- **动态目录与缓存。** 提供商/模型/力度/成本列表按 `apply` 缓存，并在 `llm/adapters-updated` 事件时失效（而非每次 spawn 重建）；`pi-ai` 目录按路由索引一次（无 O(N²)）。`getBuiltinModels` 动态导入，`yaml` 动态导入解析设置文档。力度权威来源为 `ctx.llm.resolveModelInfo()`。
+- **三档位 + 手动列表与分组。** 父模型 verdict 将对应档位标记为 `(Recommended)` 并置顶。手动列表通过 `skipEntries` 去重，标签在注册前经 `uniqueChoiceLabel` 决定（`base` → `base (provider)` → `base (provider/model)`），最多 `maxManualOptions` 个最便宜剩余模型；所有选项带 `group`（`Tiers` / `More models`，需 `user-questions` 分组变更才渲染标题，否则平铺）。
+- **自由文本 + 追问。** 自由文本先确定性解析（`deterministicMatch` + `effortFromText`，含 `xtra`/`deep` 等同义词），仅模糊文本进入有界 shortlist（≤12, `boundedTable`）的 LLM 解释。`llmText` 仅消费 `text-delta`（`block-end` 携带相同完整块，重复追加会翻倍），处理终结 `finish` 块（`reason.kind: error|aborted` → 抛错；无 finish → 抛错，永不空输出），支持 `system` + `reasoningEffort` 选项。`llmJson` 提取首个 `{…}`，失败则一次有界重试。`resolveCustomAnswer` 使用可选 `recommender` 路由否则父模型最低力度。若无法映射则再询问一次，仍失败则放行。
+- **每问独立的 `choiceMap` 与幂等包装。** 每次提问拥有独立 `Map<label, choice>`，并发永不串扰。包装通过 `Symbol.for('spawn-model-choice.wrapped')` 幂等，`dispose` 仅在仍为本插件包装时还原。`hasExplicitModelChoice` 仅检查 `provider`/`model`/`reasoningEffort`。
+- **诚实文案与日志。** 对话框 `detail` 行包含 `"Skipping or dismissing uses the configured default model."` 等提示。`cleanText`/`summarizeTask` 脱敏截断。文件日志由 `logFile` 按需开启（默认 OFF），启用后经 `cleanText` 脱敏、1MB 轮转。
 
 ## 为什么需要
 

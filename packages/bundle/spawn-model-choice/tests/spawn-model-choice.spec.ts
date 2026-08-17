@@ -11,6 +11,14 @@ import {
   summarizeTask,
   extremePick,
   priceSuffix,
+  deterministicMatch,
+  effortFromText,
+  boundedTable,
+  uniqueChoiceLabel,
+  hasExplicitModelChoice,
+  activeEfforts,
+  highestEffort,
+  lowestEffort,
 } from '../src/spawn-model-choice.mjs'
 
 describe('spawn-model-choice helpers', () => {
@@ -40,6 +48,12 @@ describe('spawn-model-choice helpers', () => {
     it('extracts the first JSON object when multiple are present', () => {
       const text = 'first {"a":1} second {"b":2}'
       expect(extractJson(text)).toEqual({ a: 1 })
+    })
+
+    it('extracts the first parseable JSON when first brace is unparsable then valid', () => {
+      // "{ not json } {"a":1}" — first balanced object fails parse, second succeeds
+      const text = '{ not json } {"valid":42} trailing'
+      expect(extractJson(text)).toEqual({ valid: 42 })
     })
   })
 
@@ -119,8 +133,12 @@ describe('spawn-model-choice helpers', () => {
   describe('priceSuffix and extremePick', () => {
     it('priceSuffix is empty when not priced, and formatted to 2 decimals when priced', () => {
       expect(priceSuffix({ priced: false, cost: null })).toBe('')
-      expect(priceSuffix({ priced: true, cost: 1.5 })).toBe(' ($1.50/1M)')
-      expect(priceSuffix({ priced: true, cost: 0.1 })).toBe(' ($0.10/1M)')
+      expect(priceSuffix({ priced: true, cost: 1.5 })).toBe(' (est. $1.50/1M)')
+      expect(priceSuffix({ priced: true, cost: 0.1 })).toBe(' (est. $0.10/1M)')
+    })
+
+    it('priceSuffix for zero-cost priced entry renders est $0.00 (cost 0 is real, not unknown)', () => {
+      expect(priceSuffix({ priced: true, cost: 0 })).toBe(' (est. $0.00/1M)')
     })
 
     it('extremePick ignores entries without efforts and with unknown cost', () => {
@@ -171,6 +189,254 @@ describe('spawn-model-choice helpers', () => {
 
       expect(efforts).toEqual(['zen', 'max'])
       expect(efforts).not.toEqual(catalogEfforts)
+    })
+  })
+
+  describe('manual label decode — displayed label always decodes', () => {
+    // helpers mirroring the plugin's internal register/decode (Map-based)
+    function registerChoice(map: Map<string, unknown>, label: string, provider: string, model: string, effort: string | undefined) {
+      map.set(label, { provider, model, effort })
+      return label
+    }
+    function decodeChoice(map: Map<string, unknown>, label: string) {
+      return map.get(label)
+    }
+
+    it('first manual entry with plain label decodes', () => {
+      const choiceMap = new Map<string, unknown>()
+      // simulate tier labels already registered
+      registerChoice(choiceMap, 'Balanced', 'p0', 'm0', 'low')
+      registerChoice(choiceMap, 'Correctness', 'p1', 'm1', 'high')
+      registerChoice(choiceMap, 'Cost', 'p2', 'm2', 'low')
+
+      const base = 'My Model'
+      const label = uniqueChoiceLabel(choiceMap, base, 'provA', 'modelA')
+      expect(label).toBe('My Model')
+      registerChoice(choiceMap, label, 'provA', 'modelA', 'high')
+      expect(decodeChoice(choiceMap, label)).toBeDefined()
+      expect(decodeChoice(choiceMap, label)).toEqual({ provider: 'provA', model: 'modelA', effort: 'high' })
+    })
+
+    it('name collision with tier label "Balanced" gets provider suffix and decodes', () => {
+      const choiceMap = new Map<string, unknown>()
+      registerChoice(choiceMap, 'Balanced', 'p0', 'm0', 'low')
+      registerChoice(choiceMap, 'Correctness', 'p1', 'm1', 'high')
+      registerChoice(choiceMap, 'Cost', 'p2', 'm2', 'low')
+
+      const base = 'Balanced'
+      const label = uniqueChoiceLabel(choiceMap, base, 'provB', 'modelB')
+      expect(label).toBe('Balanced (provB)')
+      registerChoice(choiceMap, label, 'provB', 'modelB', 'medium')
+      expect(decodeChoice(choiceMap, label)).toBeDefined()
+      expect(decodeChoice(choiceMap, label)).toEqual({ provider: 'provB', model: 'modelB', effort: 'medium' })
+    })
+
+    it('double collision (provider suffix also taken) gets provider/model suffix and decodes', () => {
+      const choiceMap = new Map<string, unknown>()
+      registerChoice(choiceMap, 'Balanced', 'p0', 'm0', 'low')
+      // pre-occupy the provider-suffixed label as well
+      registerChoice(choiceMap, 'Balanced (provB)', 'provB', 'other-model', 'low')
+
+      const base = 'Balanced'
+      const label = uniqueChoiceLabel(choiceMap, base, 'provB', 'modelB')
+      expect(label).toBe('Balanced (provB/modelB)')
+      registerChoice(choiceMap, label, 'provB', 'modelB', 'high')
+      expect(decodeChoice(choiceMap, label)).toBeDefined()
+    })
+  })
+
+  describe('duplicate model display names across providers remain independently selectable', () => {
+    function registerChoice(map: Map<string, unknown>, label: string, provider: string, model: string, effort: string | undefined) {
+      map.set(label, { provider, model, effort })
+      return label
+    }
+    function decodeChoice(map: Map<string, unknown>, label: string) {
+      return map.get(label)
+    }
+
+    it('same display name with different providers yields distinct labels, both decode', () => {
+      const choiceMap = new Map<string, unknown>()
+      // two entries share display name "Flash" but different providers
+      const name = 'Flash'
+      const labelA = uniqueChoiceLabel(choiceMap, name, 'providerA', 'flash')
+      registerChoice(choiceMap, labelA, 'providerA', 'flash', 'low')
+      const labelB = uniqueChoiceLabel(choiceMap, name, 'providerB', 'flash')
+      registerChoice(choiceMap, labelB, 'providerB', 'flash', 'high')
+
+      expect(labelA).toBe('Flash')
+      expect(labelB).toBe('Flash (providerB)')
+      expect(labelA).not.toBe(labelB)
+      expect(decodeChoice(choiceMap, labelA)).toEqual({ provider: 'providerA', model: 'flash', effort: 'low' })
+      expect(decodeChoice(choiceMap, labelB)).toEqual({ provider: 'providerB', model: 'flash', effort: 'high' })
+    })
+  })
+
+  describe('llmText single-assembly and terminal failure', () => {
+    // Replicate the plugin's fixed llmText collection logic (text-delta only, finish guard)
+    async function fixedLlmText(stream: AsyncIterable<Record<string, unknown>>): Promise<string> {
+      let text = ''
+      let finished = false
+      for await (const chunk of stream) {
+        if ((chunk as { type?: string })?.type === 'text-delta' && typeof (chunk as { text?: unknown }).text === 'string') {
+          text += (chunk as { text: string }).text
+          continue
+        }
+        if ((chunk as { type?: string })?.type === 'finish') {
+          finished = true
+          const reason = (chunk as { reason?: { kind?: string; failure?: { message?: string } } }).reason
+          if (reason?.kind === 'error' || reason?.kind === 'aborted') {
+            throw new Error(reason.failure?.message ?? `LLM request ended with ${reason.kind}`)
+          }
+        }
+      }
+      if (!finished) throw new Error('LLM stream ended without a terminal finish chunk')
+      return text
+    }
+
+    async function* fakeStreamSingleAssembly(): AsyncIterable<Record<string, unknown>> {
+      yield { type: 'text-delta', text: 'hello ' }
+      yield { type: 'text-delta', text: 'world' }
+      // block-end carries the fully assembled block — must NOT be appended again
+      yield { type: 'block-end', block: { type: 'text', text: 'hello world' } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+
+    it('single-assembly: with text-delta then block-end, collected text is deltas only (once)', async () => {
+      const text = await fixedLlmText(fakeStreamSingleAssembly())
+      expect(text).toBe('hello world')
+      // ensure it is not doubled (hello worldhello world)
+      expect(text).not.toBe('hello worldhello world')
+    })
+
+    it('terminal failure: finish with reason.kind error throws', async () => {
+      async function* errStream(): AsyncIterable<Record<string, unknown>> {
+        yield { type: 'text-delta', text: 'hi' }
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: 'boom' } } }
+      }
+      await expect(fixedLlmText(errStream())).rejects.toThrow('boom')
+    })
+
+    it('terminal failure: stream that ends without any finish chunk throws', async () => {
+      async function* noFinish(): AsyncIterable<Record<string, unknown>> {
+        yield { type: 'text-delta', text: 'hi' }
+      }
+      await expect(fixedLlmText(noFinish())).rejects.toThrow('without a terminal finish chunk')
+    })
+  })
+
+  describe('deterministicMatch + effortFromText', () => {
+    type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
+    const table = new Map<string, Row>([
+      ['provA/model-a', { provider: 'provA', model: 'model-a', name: 'Model A', efforts: ['low', 'medium', 'xhigh'], cost: 5, priced: true }],
+      ['provB/model-b', { provider: 'provB', model: 'model-b', name: 'Model B', efforts: ['low', 'max'], cost: 10, priced: true }],
+      ['provC/unique-model', { provider: 'provC', model: 'unique-model', name: 'Unique', efforts: ['low', 'high'], cost: 1, priced: true }],
+    ])
+
+    it('exact provider/model matches', () => {
+      expect(deterministicMatch(table as never, 'provA/model-a')).toBeDefined()
+      expect(deterministicMatch(table as never, 'provA/model-a')?.model).toBe('model-a')
+      expect(deterministicMatch(table as never, 'provA model-a')).toBeDefined()
+    })
+
+    it('exact model id matches when unique', () => {
+      expect(deterministicMatch(table as never, 'unique-model')?.provider).toBe('provC')
+    })
+
+    it('unique fuzzy matches (single hit) returns entry', () => {
+      // "unique" appears only in provC entry name/model
+      expect(deterministicMatch(table as never, 'unique')).toBeDefined()
+      expect(deterministicMatch(table as never, 'unique')?.model).toBe('unique-model')
+    })
+
+    it('ambiguous fuzzy returns undefined', () => {
+      // "model" appears in all three
+      expect(deterministicMatch(table as never, 'model')).toBeUndefined()
+    })
+
+    it('declared-id effort matched verbatim', () => {
+      const entry = table.get('provA/model-a')!
+      expect(effortFromText(entry as never, 'please use xhigh')).toBe('xhigh')
+    })
+
+    it('xtra maps to deepest declared', () => {
+      const entry = table.get('provA/model-a')!
+      // efforts: low, medium, xhigh → deepest is xhigh
+      expect(effortFromText(entry as never, 'use xtra please')).toBe('xhigh')
+    })
+
+    it('max maps to declared max when present', () => {
+      const entry = table.get('provB/model-b')!
+      // efforts: low, max → max is deepest and also declared verbatim
+      expect(effortFromText(entry as never, 'run at max')).toBe('max')
+      // also superlative "maximum"
+      expect(effortFromText(entry as never, 'maximum effort')).toBe('max')
+    })
+
+    it('no effort mentioned returns undefined', () => {
+      const entry = table.get('provA/model-a')!
+      expect(effortFromText(entry as never, 'just the model please')).toBeUndefined()
+    })
+  })
+
+  describe('uniqueChoiceLabel collision ladder', () => {
+    it('returns base when no collision', () => {
+      const m = new Map<string, unknown>()
+      expect(uniqueChoiceLabel(m, 'Hello', 'p', 'm')).toBe('Hello')
+    })
+    it('returns base (provider) when base taken', () => {
+      const m = new Map<string, unknown>([['Hello', {}]])
+      expect(uniqueChoiceLabel(m, 'Hello', 'myProv', 'm')).toBe('Hello (myProv)')
+    })
+    it('returns base (provider/model) when both base and provider suffix taken', () => {
+      const m = new Map<string, unknown>([
+        ['Hello', {}],
+        ['Hello (myProv)', {}],
+      ])
+      expect(uniqueChoiceLabel(m, 'Hello', 'myProv', 'myModel')).toBe('Hello (myProv/myModel)')
+    })
+  })
+
+  describe('hasExplicitModelChoice', () => {
+    it('false for empty and sizing-only keys', () => {
+      expect(hasExplicitModelChoice({})).toBe(false)
+      expect(hasExplicitModelChoice({ maxTokens: 100 } as never)).toBe(false)
+      expect(hasExplicitModelChoice(undefined)).toBe(false)
+      expect(hasExplicitModelChoice(null as never)).toBe(false)
+    })
+    it('true for provider/model/reasoningEffort', () => {
+      expect(hasExplicitModelChoice({ provider: 'p' } as never)).toBe(true)
+      expect(hasExplicitModelChoice({ model: 'm' } as never)).toBe(true)
+      expect(hasExplicitModelChoice({ reasoningEffort: 'high' } as never)).toBe(true)
+      expect(hasExplicitModelChoice({ provider: 'p', model: 'm', reasoningEffort: 'low' } as never)).toBe(true)
+    })
+  })
+
+  describe('off-only entries', () => {
+    it('highestEffort undefined when only off', () => {
+      const entry = { efforts: ['off'], cost: 1, priced: true }
+      expect(highestEffort(entry as never)).toBeUndefined()
+    })
+    it('activeEfforts excludes off', () => {
+      const entry = { efforts: ['off', 'low', 'off', 'high'] }
+      expect(activeEfforts(entry as never)).toEqual(['low', 'high'])
+      expect(activeEfforts({ efforts: ['off'] } as never)).toEqual([])
+    })
+    it('lowestEffort undefined when only off (no real efforts)', () => {
+      const entry = { efforts: ['off'] }
+      expect(lowestEffort(entry as never)).toBeUndefined()
+    })
+  })
+
+  describe('boundedTable caps at 12', () => {
+    it('never returns more than 12 entries', () => {
+      type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
+      const table = new Map<string, Row>()
+      for (let i = 0; i < 30; i++) {
+        table.set(`p/m${i}`, { provider: 'p', model: `m${i}`, name: `Model ${i}`, efforts: ['low'], cost: i, priced: true })
+      }
+      const result = boundedTable(table as never, 'model')
+      expect(result.length).toBeLessThanOrEqual(12)
+      expect(result.length).toBe(12)
     })
   })
 })
