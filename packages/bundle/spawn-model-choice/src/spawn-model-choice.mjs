@@ -57,6 +57,9 @@
  *   logFile: undefined             — optional redacted diagnostic log path (bundle
  *                                    default: OFF — file logging disabled unless
  *                                    `logFile` is set; set to a path to enable)
+ *   logUserInput: false            — whether to include custom user text in the
+ *                                    diagnostic log (default: custom user text is
+ *                                    NOT logged; opt in to log it)
  */
 
 const name = 'spawn-model-choice'
@@ -88,6 +91,7 @@ const DEFAULT_CONFIG = {
   qualityRank: {},
   recommender: undefined,
   logFile: undefined,
+  logUserInput: false,
 }
 
 /* ------------------------------------------------------------------ *
@@ -132,11 +136,15 @@ async function resolvedEfforts(ctx, provider, model, signal) {
   try {
     const resolved = await ctx.llm.resolveModelInfo(provider, model, signal)
     return {
+      // `resolved: true` is AUTHORITATIVE — including "no selectable
+      // reasoning efforts" (empty list). Fallback metadata must never
+      // override a successful authoritative answer.
+      resolved: true,
       efforts: (resolved.reasoning?.efforts ?? []).map((e) => e.id),
       defaultEffort: resolved.reasoning?.defaultEffort,
     }
   } catch {
-    return undefined
+    return { resolved: false, efforts: [], defaultEffort: undefined }
   }
 }
 
@@ -145,8 +153,12 @@ function settingsEfforts(declared, modelId) {
   if (!declared) return undefined
   for (const m of declared.models ?? []) {
     if (m.id === modelId && m.reasoningEfforts) {
+      // Keep every declared level, including empty-wire ones (the pi-ai
+      // format allows `off:` with an empty wire value). Levels are never
+      // injected raw — activeEfforts excludes 'off' and validateCandidate
+      // guards the final request — so a preserved 'off' is safe.
       return Object.entries(m.reasoningEfforts)
-        .filter(([, wire]) => wire !== null && wire !== undefined && wire !== '')
+        .filter(([, wire]) => wire !== null && wire !== undefined)
         .map(([level]) => level)
     }
   }
@@ -191,11 +203,14 @@ async function buildModelTable(ctx) {
         let efforts = []
         let defaultEffort
         let cost = UNKNOWN_COST
+        let effortResolved = false
         try {
           const resolved = await resolvedEfforts(ctx, provider.id, info.id)
-          if (resolved && resolved.efforts.length > 0) {
+          if (resolved?.resolved) {
+            // Authoritative, including an empty effort list.
             efforts = resolved.efforts
             defaultEffort = resolved.defaultEffort
+            effortResolved = true
           }
         } catch { /* best-effort */ }
         // Catalog PRICING is independent of the effort source.
@@ -207,7 +222,9 @@ async function buildModelTable(ctx) {
             cost = blended >= 0 ? blended : UNKNOWN_COST
           }
         } catch { /* catalog lookup is best-effort */ }
-        if (efforts.length === 0) {
+        // Fallbacks run ONLY when the adapter did not resolve: a successful
+        // authoritative answer of "no selectable reasoning efforts" wins.
+        if (!effortResolved && efforts.length === 0) {
           const declaredEfforts = settingsEfforts(declared, info.id)
           if (declaredEfforts) {
             // The deployment's declared levels are authoritative for that model.
@@ -474,6 +491,16 @@ function deterministicMatch(table, text) {
   if (hits.length === 1) return hits[0]
   hits = entries.filter((e) => norm(e.name) === t)
   if (hits.length === 1) return hits[0]
+  // Reverse containment: a natural answer embeds the model's id or name
+  // ("Alpha at high effort" contains "alpha"). Longest embedded name wins;
+  // more than one match is ambiguous and goes to the LLM path.
+  hits = entries.filter((e) => {
+    const id = norm(e.model)
+    const name = norm(e.name)
+    return (id.length > 2 && t.includes(id)) || (name.length > 2 && t.includes(name))
+  })
+  if (hits.length === 1) return hits[0]
+  // Unique forward containment for short queries ("gpt-5.5", "flash").
   hits = entries.filter((e) => norm(e.model).includes(t) || norm(e.name).includes(t))
   if (hits.length === 1) return hits[0]
   return undefined
@@ -504,15 +531,19 @@ function effortFromText(entry, text) {
 function boundedTable(table, text) {
   const entries = [...table.values()]
   const tokens = text.toLowerCase().split(/\W+/).filter((w) => w.length > 2)
-  const fuzzy = new Set()
-  for (const e of entries) {
+  const fuzzy = entries.filter((e) => {
     const hay = `${e.provider} ${e.model} ${e.name}`.toLowerCase()
-    if (tokens.some((tok) => hay.includes(tok))) fuzzy.add(e)
-  }
-  const ranked = [...fuzzy, ...entries].filter((e, i, a) => a.indexOf(e) === i)
-    .sort((a, b) => (a.cost ?? Infinity) - (b.cost ?? Infinity))
-    .slice(0, 12)
-  return new Map(ranked.map((e) => [`${e.provider}/${e.model}`, e]))
+    return tokens.some((tok) => hay.includes(tok))
+  })
+  const fuzzySet = new Set(fuzzy)
+  const byCost = (a, b) => (a.cost ?? Infinity) - (b.cost ?? Infinity)
+  // Fuzzy candidates stay AHEAD of unrelated cheap models: a relevant match
+  // must never be pushed out of the 12-entry budget by cheaper noise.
+  const shortlist = [
+    ...fuzzy.sort(byCost),
+    ...entries.filter((e) => !fuzzySet.has(e)).sort(byCost),
+  ].slice(0, 12)
+  return new Map(shortlist.map((e) => [`${e.provider}/${e.model}`, e]))
 }
 
 /**
@@ -616,9 +647,13 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
   if (correctness) {
     const eff = highestEffort(correctness)
     const rank = rankOf(correctness)
+    // The label never implies an empirical quality judgment the plugin has
+    // not made: "Correctness" only when a qualityRank exists; otherwise the
+    // tier is honestly named by its actual criterion.
+    const tierLabel = correctnessBy === 'rank' ? 'Correctness' : 'Highest-priced'
     tiers.push({
       key: 'correctness',
-      label: registerChoice(choiceMap, 'Correctness', correctness.provider, correctness.model, eff),
+      label: registerChoice(choiceMap, tierLabel, correctness.provider, correctness.model, eff),
       description: correctnessBy === 'rank'
         ? `Top quality rank (${rank}) — ${correctness.name} at ${eff}${priceSuffix(correctness)}`
         : `Highest estimated price — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
@@ -686,7 +721,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
   const resolveAnswer = async (answer, isFollowUp) => {
     const item = answer.answers?.find((a) => a.id === 'spawn-model-choice')
     const picked = item?.selected?.[0]
-    const customLog = item?.custom
+    const customLog = cfg.logUserInput && item?.custom
       ? `custom=${JSON.stringify(cleanText(item.custom).slice(0, 40))}${item.custom.length > 40 ? '…' : ''}`
       : ''
     logLine(`askModel: picked=${JSON.stringify(picked)}${customLog ? ' ' + customLog : ''}`)
@@ -765,7 +800,13 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
         id: 'spawn-model-choice',
         header: 'Subagent model',
         question: `Choose the model and reasoning effort for “${cleanText(label)}”.`,
-        detail: `Task: ${summarizeTask(rawTask) || 'no task description.'}\nDefault: ${balanced ? `${balanced.name} at ${defaultModel.reasoningEffort ?? 'model default'}${priceSuffix(balanced)}` : 'the configured default model'} — skipping or dismissing keeps it. You can also type a model name and effort.\nPrices are per-1M blended input/output estimates.`,
+        detail: `Task: ${summarizeTask(rawTask) || 'no task description.'}\n`
+          + `Default: ${balanced
+            ? `${balanced.name} at ${defaultModel.reasoningEffort ?? 'model default'}`
+              + `${priceSuffix(balanced)}`
+            : 'the configured default model'} `
+          + '— skipping or dismissing keeps it. You can also type a model name and effort.\n'
+          + 'Prices are per-1M blended input/output estimates.',
         options,
       }],
     })
@@ -793,7 +834,8 @@ async function classifyTask(ctx, cfg, judge, table, task, signal) {
   let text = ''
   try {
     text = await llmText(ctx, route, [await pluginUserMessage(
-      'Classify the complexity of this delegated task. Reply with exactly one word: simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
+      'Classify the complexity of this delegated task. Reply with exactly one word: '
+        + 'simple, medium, or hard.\n\nTASK: ' + task.slice(0, 1200),
     )], signal, { effort })
   } catch (error) {
     logLine(`classify: call failed ${String(error?.message ?? error)}`)
@@ -810,17 +852,19 @@ function withAgentOptions(request, chosen) {
   if (!chosen || !chosen.provider || !chosen.model) return request
   const original = request.agentOptions ?? {}
   const { reasoningEffort: previousEffort, ...rest } = original
+  const sameRoute = original.provider === chosen.provider && original.model === chosen.model
   return {
     ...request,
     agentOptions: {
       ...rest,
       provider: chosen.provider,
       model: chosen.model,
-      // A choice with no effort leaves the spawn's own explicit effort
-      // untouched; a chosen effort always wins.
+      // A chosen effort always wins. Without one, "use that model's default":
+      // the spawn's previous explicit effort survives ONLY when the route is
+      // unchanged — a stale effort from another model must never ride along.
       ...(chosen.effort
         ? { reasoningEffort: chosen.effort }
-        : previousEffort !== undefined
+        : sameRoute && previousEffort !== undefined
           ? { reasoningEffort: previousEffort }
           : {}),
     },
@@ -828,21 +872,25 @@ function withAgentOptions(request, chosen) {
 }
 
 /**
- * Validate an injected route through the harness's own resolver: an
- * invalid/stale provider/model/effort must fail open to the untouched
- * request rather than breaking the spawn after interception.
+ * Validate the FINAL candidate request through the harness's own resolver —
+ * the exact agentOptions that will be sent (including any preserved effort
+ * and maxTokens), not just the chosen route. An invalid/stale combination
+ * must fail open to the untouched request.
  */
-async function validateChoice(ctx, chosen, signal) {
-  if (!chosen || !ctx.llm?.resolveCallConfig) return true
+async function validateCandidate(ctx, candidate, signal) {
+  const options = candidate?.agentOptions
+  if (!options?.provider || !options?.model || !ctx.llm?.resolveCallConfig) return true
   try {
     await ctx.llm.resolveCallConfig({
-      provider: chosen.provider,
-      model: chosen.model,
-      ...(chosen.effort ? { reasoningEffort: chosen.effort } : {}),
+      provider: options.provider,
+      model: options.model,
+      ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+      ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
     }, signal)
     return true
   } catch (error) {
-    logLine(`validateChoice: rejected ${chosen.provider}/${chosen.model}@${chosen.effort ?? 'default'}: ${String(error?.message ?? error)}`)
+    logLine(`validateCandidate: rejected ${options.provider}/${options.model}`
+      + `@${options.reasoningEffort ?? 'default'}: ${String(error?.message ?? error)}`)
     return false
   }
 }
@@ -854,8 +902,35 @@ async function validateChoice(ctx, chosen, signal) {
 /** Global-registry marker so reloads and duplicate inserts never double-wrap. */
 const WRAP_MARKER = Symbol.for('spawn-model-choice.wrapped')
 
-function apply(ctx, config = {}) {
+/** Clamp and validate user config; malformed values fall back to defaults. */
+function normalizeConfig(config) {
   const cfg = { ...DEFAULT_CONFIG, ...(config ?? {}) }
+  const maxManual = Number(cfg.maxManualOptions)
+  cfg.maxManualOptions = Number.isFinite(maxManual) ? Math.min(10, Math.max(0, Math.trunc(maxManual))) : DEFAULT_CONFIG.maxManualOptions
+  const qualityRank = {}
+  for (const [key, value] of Object.entries(cfg.qualityRank ?? {})) {
+    if (typeof value === 'number' && Number.isFinite(value)) qualityRank[key] = value
+  }
+  cfg.qualityRank = qualityRank
+  const rec = cfg.recommender
+  cfg.recommender = (rec && typeof rec.provider === 'string' && typeof rec.model === 'string')
+    ? {
+        provider: rec.provider,
+        model: rec.model,
+        ...(typeof rec.reasoningEffort === 'string' ? { reasoningEffort: rec.reasoningEffort } : {}),
+      }
+    : undefined
+  cfg.logFile = (typeof cfg.logFile === 'string' && cfg.logFile.length > 0) ? cfg.logFile : undefined
+  cfg.logUserInput = cfg.logUserInput === true
+  return cfg
+}
+
+function apply(ctx, config = {}) {
+  const cfg = normalizeConfig(config)
+  // Application-local logging: this application's destination is restored to
+  // the previous one when the effect disposes, so a reload's config never
+  // leaks into the next application.
+  const previousLogFile = LOG_FILE
   if (cfg.logFile !== undefined) LOG_FILE = cfg.logFile
   logLine(`apply: mounting enabled=${cfg.enabled} askWhenExplicit=${cfg.askWhenExplicit} pid=${process.pid}`)
   if (!cfg.enabled) return
@@ -870,26 +945,60 @@ function apply(ctx, config = {}) {
     return
   }
 
-  const originalStart = subagents.start?.bind(subagents)
-  const originalStartContinuable = subagents.startContinuable?.bind(subagents)
+  const originalStart = subagents.start
+  const originalStartContinuable = subagents.startContinuable
 
-  // The model table is advisory and changes only when the harness topology
-  // changes: cache it and invalidate on the adapter topology event instead of
-  // rebuilding per spawn.
-  let tableCache = null
-  let tableBuild = null
-  const getTable = async () => {
-    if (tableCache) return tableCache
-    if (!tableBuild) {
-      tableBuild = buildModelTable(ctx)
-        .then((t) => { tableCache = t; return t })
-        .finally(() => { tableBuild = null })
-    }
-    return tableBuild
+  // The model table is advisory and changes when the harness topology OR the
+  // relevant settings namespaces change. A generation token makes an
+  // in-flight build's result land only if no invalidation happened meanwhile.
+  let tableCache = undefined
+  let tableBuild = undefined
+  let tableGeneration = 0
+  const invalidateTable = () => {
+    tableGeneration += 1
+    tableCache = undefined
   }
-  try {
-    ctx.on?.('llm/adapters-updated', () => { tableCache = null })
-  } catch { /* best-effort */ }
+  const getTable = async () => {
+    if (tableCache !== undefined) return tableCache
+    const generation = tableGeneration
+    if (tableBuild === undefined || tableBuild.generation !== generation) {
+      const slot = { generation, promise: undefined }
+      slot.promise = buildModelTable(ctx)
+        .then((table) => {
+          if (tableGeneration === generation) tableCache = table
+          return table
+        })
+        .finally(() => {
+          if (tableBuild === slot) tableBuild = undefined
+        })
+      tableBuild = slot
+    }
+    return tableBuild.promise
+  }
+  const disposeEvents = []
+  const onEvent = (event, handler) => {
+    try {
+      const off = ctx.on?.(event, handler)
+      if (typeof off === 'function') disposeEvents.push(off)
+    } catch { /* best-effort */ }
+  }
+  onEvent('llm/adapters-updated', invalidateTable)
+  onEvent('settings/updated', (namespace) => {
+    // Model lists, overrides and reasoning configuration can change while the
+    // registered route set stays identical — invalidate on the relevant
+    // namespaces too.
+    if (namespace === 'llm-pi-ai' || namespace === 'llm-deepseek') invalidateTable()
+  })
+
+  /** True when the spawning agent is a delegated (non-root) child. */
+  const isNestedSpawn = (parent) => {
+    try {
+      const roots = ctx.agents?.roots?.()
+      return Array.isArray(roots) && roots.length > 0 && !roots.some((root) => root === parent)
+    } catch {
+      return false
+    }
+  }
 
   const intercept = async (request, view = {}) => {
     // Continuable spawns carry label/signal on the OUTER spec, not on
@@ -900,6 +1009,12 @@ function apply(ctx, config = {}) {
     const requestView = { ...request, label, signal }
     const labelLog = cleanText(label).slice(0, 40)
     try {
+      // Root-only, checked BEFORE any table build or classifier call: a
+      // nested spawn must be operationally "exactly as without the plugin".
+      if (isNestedSpawn(request.parent)) {
+        logLine(`intercept: skip (nested spawn, root-only) label=${labelLog}`)
+        return request
+      }
       if (request.agentOptions && hasExplicitModelChoice(request.agentOptions) && !cfg.askWhenExplicit) {
         logLine(`intercept: skip (explicit agentOptions) label=${labelLog}`)
         return request
@@ -911,11 +1026,12 @@ function apply(ctx, config = {}) {
       const chosen = await askModel(ctx, cfg, requestView, table, defaultModel)
       logLine(`intercept: ask result=${JSON.stringify(chosen)} label=${labelLog}`)
       if (!chosen) return request
-      if (!(await validateChoice(ctx, chosen, signal))) {
-        logLine(`intercept: invalid choice dropped label=${labelLog}`)
+      const candidate = withAgentOptions(request, chosen)
+      if (!(await validateCandidate(ctx, candidate, signal))) {
+        logLine(`intercept: invalid candidate dropped label=${labelLog}`)
         return request
       }
-      return withAgentOptions(request, chosen)
+      return candidate
     } catch (error) {
       logLine(`intercept: ERROR ${String(error)} label=${labelLog}`)
       // Fail-open: never break delegation because of this plugin.
@@ -923,47 +1039,67 @@ function apply(ctx, config = {}) {
     }
   }
 
-  let wrappedStart
-  if (typeof originalStart === 'function') {
-    wrappedStart = async (provider, request) => {
-      return originalStart(provider, await intercept(request))
+  // Install and restore the patch inside ONE cordis effect: the disposer is
+  // what actually runs on fiber unload/HMR (a plain 'dispose' listener is not
+  // a lifecycle mechanism). Restore only when the installed methods are still
+  // this application's wrappers, and restore the previous log destination.
+  const owner = {}
+  const install = () => {
+    if (subagents[WRAP_MARKER] !== undefined) {
+      logLine('apply: already wrapped (idempotent); skipping')
+      return undefined
     }
-    subagents.start = wrappedStart
-    logLine('apply: wrapped subagents.start')
-  } else {
-    logLine('apply: WARN subagents.start not a function')
+    let wrappedStart
+    let wrappedStartContinuable
+    if (typeof originalStart === 'function') {
+      wrappedStart = async (provider, request) => {
+        return originalStart.call(subagents, provider, await intercept(request))
+      }
+      subagents.start = wrappedStart
+      logLine('apply: wrapped subagents.start')
+    } else {
+      logLine('apply: WARN subagents.start not a function')
+    }
+    if (typeof originalStartContinuable === 'function') {
+      wrappedStartContinuable = async (spec) => {
+        const request = await intercept(spec.request, { label: spec.label, signal: spec.signal })
+        return originalStartContinuable.call(subagents, request === spec.request ? spec : { ...spec, request })
+      }
+      subagents.startContinuable = wrappedStartContinuable
+      logLine('apply: wrapped subagents.startContinuable')
+    } else {
+      logLine('apply: WARN subagents.startContinuable not a function')
+    }
+    subagents[WRAP_MARKER] = owner
+    return () => {
+      try {
+        if (subagents[WRAP_MARKER] !== owner) return
+        if (subagents.start === wrappedStart) subagents.start = originalStart
+        if (subagents.startContinuable === wrappedStartContinuable) {
+          subagents.startContinuable = originalStartContinuable
+        }
+        if (subagents.start === originalStart && subagents.startContinuable === originalStartContinuable) {
+          delete subagents[WRAP_MARKER]
+        }
+        for (const off of disposeEvents) { try { off() } catch { /* best-effort */ } }
+        LOG_FILE = previousLogFile
+      } catch { /* best-effort */ }
+    }
   }
 
-  let wrappedStartContinuable
-  if (typeof originalStartContinuable === 'function') {
-    wrappedStartContinuable = async (spec) => {
-      const request = await intercept(spec.request, { label: spec.label, signal: spec.signal })
-      return originalStartContinuable(request === spec.request ? spec : { ...spec, request })
-    }
-    subagents.startContinuable = wrappedStartContinuable
-    logLine('apply: wrapped subagents.startContinuable')
-  } else {
-    logLine('apply: WARN subagents.startContinuable not a function')
-  }
-
-  subagents[WRAP_MARKER] = true
-
-  // Restore the originals on dispose, but only if they are still OUR
-  // wrappers (never clobber a later wrapper from a reload or another plugin).
-  const restore = () => {
+  if (typeof ctx.effect === 'function') {
     try {
-      if (subagents[WRAP_MARKER] && subagents.start === wrappedStart) subagents.start = originalStart
-      if (subagents[WRAP_MARKER] && subagents.startContinuable === wrappedStartContinuable) {
-        subagents.startContinuable = originalStartContinuable
-      }
-      if (subagents.start === originalStart && subagents.startContinuable === originalStartContinuable) {
-        delete subagents[WRAP_MARKER]
-      }
-    } catch { /* best-effort */ }
+      ctx.effect(install, 'spawn-model-choice.install()')
+      return
+    } catch (error) {
+      logLine(`apply: effect install failed ${String(error?.message ?? error)}`)
+    }
   }
-  try {
-    ctx.on?.('dispose', restore)
-  } catch { /* best-effort */ }
+  // Fallback for hosts without ctx.effect: install directly (documented).
+  const disposer = install()
+  if (typeof disposer === 'function') {
+    try { ctx.on?.('dispose', disposer) } catch { /* best-effort */ }
+  }
 }
 
 export {
@@ -971,5 +1107,6 @@ export {
   // Pure helpers, exported for tests (no harness state required).
   activeEfforts, boundedTable, cleanText, deterministicMatch, effortFromText,
   extractJson, extremePick, hasExplicitModelChoice, highestEffort, llmText,
-  lowestEffort, priceSuffix, summarizeTask, uniqueChoiceLabel, withAgentOptions,
+  lowestEffort, normalizeConfig, priceSuffix, summarizeTask, uniqueChoiceLabel,
+  validateCandidate, withAgentOptions,
 }

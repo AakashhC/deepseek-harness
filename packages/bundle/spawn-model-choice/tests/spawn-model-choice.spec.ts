@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  apply,
   extractJson,
   withAgentOptions,
   cleanText,
@@ -20,6 +21,8 @@ import {
   highestEffort,
   lowestEffort,
   llmText,
+  normalizeConfig,
+  validateCandidate,
 } from '../src/spawn-model-choice.mjs'
 
 describe('spawn-model-choice helpers', () => {
@@ -72,7 +75,7 @@ describe('spawn-model-choice helpers', () => {
       expect(out.agentOptions.reasoningEffort).toBe('xhigh')
     })
 
-    it('preserves the original explicit reasoningEffort when the choice has no effort', () => {
+    it('clears the original explicit reasoningEffort on a route switch (no-effort choice = model default)', () => {
       const request = {
         label: 'x',
         agentOptions: { provider: 'old-p', model: 'old-m', reasoningEffort: 'medium' },
@@ -80,7 +83,7 @@ describe('spawn-model-choice helpers', () => {
       }
       const chosen = { provider: 'new-p', model: 'new-m', effort: undefined }
       const out = withAgentOptions(request, chosen)
-      expect(out.agentOptions.reasoningEffort).toBe('medium')
+      expect(out.agentOptions.reasoningEffort).toBeUndefined()
       expect(out.agentOptions.provider).toBe('new-p')
     })
 
@@ -504,6 +507,109 @@ describe('spawn-model-choice helpers', () => {
       expect([...result.keys()][0]).toBe('p/cheap-fuzzy')
       expect([...result.values()][0].model).toBe('cheap-fuzzy')
       expect(result.get('p/cheap-fuzzy')?.name).toBe('Cheap FuzzyUnique')
+    })
+  })
+
+  describe('round-8 review fixes', () => {
+    it('withAgentOptions clears a stale effort on a route switch', () => {
+      const out = withAgentOptions(
+        { agentOptions: { provider: 'old', model: 'old-model', reasoningEffort: 'xhigh', maxTokens: 123 } },
+        { provider: 'new', model: 'new-model', effort: undefined },
+      )
+      expect(out.agentOptions.reasoningEffort).toBeUndefined()
+      expect(out.agentOptions.provider).toBe('new')
+      expect(out.agentOptions.maxTokens).toBe(123)
+    })
+
+    it('withAgentOptions preserves an explicit effort only on the same route', () => {
+      const out = withAgentOptions(
+        { agentOptions: { provider: 'p', model: 'm', reasoningEffort: 'high' } },
+        { provider: 'p', model: 'm', effort: undefined },
+      )
+      expect(out.agentOptions.reasoningEffort).toBe('high')
+    })
+
+    it('normalizeConfig clamps and validates user config', () => {
+      const cfg = normalizeConfig({
+        maxManualOptions: 500,
+        qualityRank: { 'a/b': 10, 'c/d': 'bad', 'e/f': Infinity },
+        recommender: { provider: 'p' },
+        logFile: 42,
+        logUserInput: true,
+      })
+      expect(cfg.maxManualOptions).toBe(10)
+      expect(cfg.qualityRank).toEqual({ 'a/b': 10 })
+      expect(cfg.recommender).toBeUndefined()
+      expect(cfg.logFile).toBeUndefined()
+      expect(cfg.logUserInput).toBe(true)
+      expect(normalizeConfig({ maxManualOptions: -3 }).maxManualOptions).toBe(0)
+    })
+
+    it('validateCandidate validates the FINAL merged agentOptions', async () => {
+      const calls: Array<{ cfg: Record<string, unknown>; signal: unknown }> = []
+      const ctx = {
+        llm: {
+          resolveCallConfig: async (cfg: unknown, signal: unknown) => {
+            calls.push({ cfg: cfg as Record<string, unknown>, signal })
+            return cfg
+          },
+        },
+      }
+      const opts = { provider: 'p', model: 'm', reasoningEffort: 'high', maxTokens: 123 }
+      const ok = await validateCandidate(ctx as never, { agentOptions: opts }, 'sig')
+      expect(ok).toBe(true)
+      expect(calls[0]?.cfg.maxTokens).toBe(123)
+      expect(calls[0]?.cfg.reasoningEffort).toBe('high')
+      expect(calls[0]?.signal).toBe('sig')
+      const rejectCtx = { llm: { resolveCallConfig: async () => { throw new Error('UNSUPPORTED_REASONING_EFFORT') } } }
+      const bad = { agentOptions: { provider: 'p', model: 'm', reasoningEffort: 'xhigh' } }
+      expect(await validateCandidate(rejectCtx as never, bad)).toBe(false)
+    })
+
+    it('deterministicMatch resolves an embedded model name with effort words', () => {
+      type Row = { provider: string; model: string; name: string; efforts: string[]; cost: number | null; priced: boolean }
+      const table = new Map<string, Row>()
+      table.set('p/deepseek-v4-flash', { provider: 'p', model: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', efforts: ['low', 'high'], cost: 1, priced: true })
+      table.set('p/gpt-5.5', { provider: 'p', model: 'gpt-5.5', name: 'GPT-5.5 via AI21', efforts: ['low', 'high'], cost: 2, priced: true })
+      expect(deterministicMatch(table as never, 'DeepSeek V4 Flash at high effort')?.model).toBe('deepseek-v4-flash')
+      // Effort words are not model identifiers: "max" must not match by itself.
+      expect(deterministicMatch(table as never, 'gpt max')).toBeUndefined()
+    })
+
+    it('apply installs wrappers inside ctx.effect and the disposer restores the originals', () => {
+      let disposer: (() => void) | undefined
+      const originalStart = async () => 'started'
+      const originalStartContinuable = async () => 'continued'
+      const subagents = { start: originalStart, startContinuable: originalStartContinuable } as never as Record<string, unknown>
+      const ctx = {
+        effect: (fn: () => (() => void) | undefined) => { disposer = fn() },
+        on: () => () => {},
+        subagents,
+        agents: { roots: () => [{}] },
+        llm: {
+          listProviders: () => [],
+          listModels: async () => [],
+          resolveModelInfo: async () => { throw new Error('nope') },
+          resolveCallConfig: async (c: unknown) => c,
+          stream: () => (async function* () { yield { type: 'finish', reason: { kind: 'stop' } } }()),
+        },
+        settings: {},
+        agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+        userQuestions: { ask: async () => ({ answers: [{ id: 'spawn-model-choice', selected: [] }] }) },
+      }
+      apply(ctx as never, { enabled: true })
+      const wrappedStart = subagents.start
+      expect(wrappedStart).not.toBe(originalStart)
+      expect(subagents.startContinuable).not.toBe(originalStartContinuable)
+      // The effect disposer must restore the EXACT originals and the marker.
+      disposer?.()
+      expect(subagents.start).toBe(originalStart)
+      expect(subagents.startContinuable).toBe(originalStartContinuable)
+      // A reload applies cleanly after disposal (no stale marker).
+      apply(ctx as never, { enabled: true })
+      expect(subagents.start).not.toBe(originalStart)
+      disposer?.()
+      expect(subagents.start).toBe(originalStart)
     })
   })
 })
