@@ -92,7 +92,9 @@
 }
 
 .detail {
-  margin: 0 2px 8px;
+  margin: 2px 24px 12px;
+  font-size: 13px;
+  line-height: 20px;
 }
 
 .footerActions {
@@ -155,9 +157,18 @@
 .options {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 3px;
   margin: 8px 0 0;
   padding: 4px 12px;
+}
+
+.groupHeader {
+  margin: 8px 8px 2px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
 }
 
 .option {

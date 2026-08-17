@@ -355,3 +355,103 @@ describe('parseRecommendedLabel', () => {
     expect(parseRecommendedLabel('Plain')).toEqual({ label: 'Plain', recommended: false })
   })
 })
+
+describe('option groups', () => {
+  it('renders a heading before the first grouped option and at each group change, but not for flat lists', () => {
+    // Flat list — no group on any option keeps today's rendering: zero headings.
+    const flat = new PendingWait(
+      'question', RpcId('flat'), SID,
+      { questions: [{ id: 'q', question: 'pick', options: [{ label: 'A' }, { label: 'B' }] }] },
+      vi.fn(),
+    )
+    const view = render(<QuestionComposer matched={flat} interactions={[flat]} {...kit} />)
+    expect(view.container.querySelectorAll('[class*="groupHeader"]')).toHaveLength(0)
+    view.unmount()
+    cleanup()
+
+    // Grouped list — "Tiers" heads the first two options, "More models" heads the next two.
+    const grouped = new PendingWait(
+      'question', RpcId('grouped'), SID,
+      {
+        questions: [{
+          id: 'q', question: 'pick',
+          options: [
+            { label: 'T1', group: 'Tiers' },
+            { label: 'T2', group: 'Tiers' },
+            { label: 'M1', group: 'More models' },
+            { label: 'M2', group: 'More models' },
+          ],
+        }],
+      },
+      vi.fn(),
+    )
+    const groupedView = render(<QuestionComposer matched={grouped} interactions={[grouped]} {...kit} />)
+    const headings = groupedView.container.querySelectorAll('[class*="groupHeader"]')
+    expect(headings).toHaveLength(2)
+    expect(headings[0]?.textContent).toBe('Tiers')
+    expect(headings[1]?.textContent).toBe('More models')
+    // First heading precedes the first option; second heading sits between option 2 and 3.
+    expect(screen.getByRole('radio', { name: 'T1' })).toBeTruthy()
+    expect(screen.getByRole('radio', { name: 'M1' })).toBeTruthy()
+    // Heading rows are plain divs, not interactive controls.
+    expect(groupedView.container.querySelector('[class*="groupHeader"]')?.tagName).toBe('DIV')
+    groupedView.unmount()
+    cleanup()
+
+    // Absent→present transition — first option flat, second starts a group.
+    const mixed = new PendingWait(
+      'question', RpcId('mixed'), SID,
+      {
+        questions: [{
+          id: 'q', question: 'pick',
+          options: [
+            { label: 'Flat' },
+            { label: 'G1', group: 'Grouped' },
+            { label: 'G2', group: 'Grouped' },
+          ],
+        }],
+      },
+      vi.fn(),
+    )
+    render(<QuestionComposer matched={mixed} interactions={[mixed]} {...kit} />)
+    const mixedHeadings = document.querySelectorAll('[class*="groupHeader"]')
+    expect(mixedHeadings).toHaveLength(1)
+    expect(mixedHeadings[0]?.textContent).toBe('Grouped')
+    // No heading for the flat option.
+    expect(screen.getByRole('radio', { name: 'Flat' })).toBeTruthy()
+  })
+
+  it('keeps option numbers continuous across groups and leaves the Recommended badge untouched', () => {
+    const carrier = new PendingWait(
+      'question', RpcId('badge-grouped'), SID,
+      {
+        questions: [{
+          id: 'q', question: 'pick',
+          options: [
+            { label: 'Fast (Recommended)', group: 'Tiers' },
+            { label: 'Balanced', group: 'Tiers' },
+            { label: 'Custom', group: 'More models' },
+          ],
+        }],
+      },
+      vi.fn(),
+    )
+    const view = render(<QuestionComposer matched={carrier} interactions={[carrier]} {...kit} t={seatOver(en, commonEn)} />)
+    // Numbers are global, not per-group (scoped to the options list; only the
+    // non-empty chips are option numbers — unrelated elements can carry a
+    // "number"-ish class name).
+    const optionsBox = view.container.querySelector('[class*="options"]')
+    const numbers = [...(optionsBox?.querySelectorAll('[class*="number"]') ?? [])]
+      .map(n => n.textContent?.trim())
+      .filter(Boolean)
+    expect(numbers).toEqual(['1', '2', '3'])
+    // Badge still stripped via parseRecommendedLabel and rendered alongside the heading.
+    expect(screen.getByText('Recommended')).toBeTruthy()
+    expect(screen.getByRole('radio', { name: 'Fast' })).toBeTruthy()
+    // Group headings present.
+    expect(screen.getByText('Tiers')).toBeTruthy()
+    expect(screen.getByText('More models')).toBeTruthy()
+    // parseRecommendedLabel contract unchanged.
+    expect(parseRecommendedLabel('Fast (Recommended)')).toEqual({ label: 'Fast', recommended: true })
+  })
+})

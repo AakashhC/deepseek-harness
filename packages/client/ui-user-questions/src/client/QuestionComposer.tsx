@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react'
+import { Fragment, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react'
 import clsx from 'clsx'
 import {
   Button, IconCheckOutline14, IconChevronDownOutline14, IconChevronLeftOutline14,
@@ -241,40 +241,45 @@ function QuestionFlow({ pending, t }: { pending: PendingQuestion } & Pick<Questi
                 {(question.options ?? []).map((option, optionIndex) => {
                   const selected = draft.selected.includes(option.label)
                   const display = parseRecommendedLabel(option.label)
+                  const prevGroup = question.options?.[optionIndex - 1]?.group
+                  const showGroup = option.group !== undefined && option.group !== prevGroup
                   return (
-                    <button
-                      type="button" key={`${option.label}-${String(optionIndex)}`}
-                      className={clsx(css.option, selected && question.multiSelect !== true && css.optionSelected)}
-                      role={question.multiSelect === true ? 'checkbox' : 'radio'}
-                      aria-checked={selected}
-                      aria-label={display.label}
-                      disabled={busy !== null}
-                      onClick={() => { choose(option.label) }}
-                      onKeyDown={(event) => {
-                        if (event.key !== 'Enter' || !drafts.every(completed)) return
-                        event.preventDefault()
-                        submitDrafts(drafts)
-                      }}
-                    >
-                      {question.multiSelect === true
-                        ? (
-                          <span className={clsx(css.checkbox, selected && css.checkboxChecked)} aria-hidden="true">
-                            {selected && <IconCheckOutline14 size={12} />}
+                    <Fragment key={`${option.label}-${String(optionIndex)}`}>
+                      {showGroup && <div className={css.groupHeader}>{option.group}</div>}
+                      <button
+                        type="button"
+                        className={clsx(css.option, selected && question.multiSelect !== true && css.optionSelected)}
+                        role={question.multiSelect === true ? 'checkbox' : 'radio'}
+                        aria-checked={selected}
+                        aria-label={display.label}
+                        disabled={busy !== null}
+                        onClick={() => { choose(option.label) }}
+                        onKeyDown={(event) => {
+                          if (event.key !== 'Enter' || !drafts.every(completed)) return
+                          event.preventDefault()
+                          submitDrafts(drafts)
+                        }}
+                      >
+                        {question.multiSelect === true
+                          ? (
+                            <span className={clsx(css.checkbox, selected && css.checkboxChecked)} aria-hidden="true">
+                              {selected && <IconCheckOutline14 size={12} />}
+                            </span>
+                          )
+                          : <span className={css.number}>{optionIndex + 1}</span>}
+                        <span className={css.optionCopy}>
+                          <span className={css.optionLine}>
+                            <span className={css.optionLabel}>{display.label}</span>
+                            {display.recommended && (
+                              <span className={css.badge}>{t('option.recommended')}</span>
+                            )}
+                            {option.description !== undefined && (
+                              <span className={css.description}>{option.description}</span>
+                            )}
                           </span>
-                        )
-                        : <span className={css.number}>{optionIndex + 1}</span>}
-                      <span className={css.optionCopy}>
-                        <span className={css.optionLine}>
-                          <span className={css.optionLabel}>{display.label}</span>
-                          {display.recommended && (
-                            <span className={css.badge}>{t('option.recommended')}</span>
-                          )}
-                          {option.description !== undefined && (
-                            <span className={css.description}>{option.description}</span>
-                          )}
                         </span>
-                      </span>
-                    </button>
+                      </button>
+                    </Fragment>
                   )
                 })}
 

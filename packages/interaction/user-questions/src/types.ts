@@ -11,6 +11,12 @@ export interface AskUserQuestionOption {
   label: string
   /** Optional extra context rendered by capable UIs. */
   description?: string
+  /**
+   * Optional group heading; options sharing a group render under one heading,
+   * and a change of group starts a new heading. Absent on every option keeps
+   * today's flat rendering — strictly additive.
+   */
+  group?: string
 }
 
 /**
