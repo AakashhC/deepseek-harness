@@ -13,7 +13,7 @@
 
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import { foldConsumedWork } from '@deepseek-ai/dsh-agent'
+import { foldConsumedWork, installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -123,6 +123,12 @@ export async function startInProcessRun(
       persona: request.persona,
       toolFilter: request.toolFilter,
     })
+    if (request.modelSelection !== undefined) {
+      installModelSelection(childCtx, {
+        current: { ...request.modelSelection },
+        assembled: undefined,
+      })
+    }
     if (request.outputSchema !== undefined) {
       structured = attachStructuredRuntime(childCtx, request.outputSchema)
     }

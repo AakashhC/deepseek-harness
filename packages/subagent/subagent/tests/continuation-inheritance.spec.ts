@@ -14,7 +14,7 @@ import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId, type LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
 import SandboxPolicyService, { effectiveSandboxMode, setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
@@ -37,7 +37,7 @@ afterEach(async () => {
 })
 
 /** Boot the continuable stack plus both policy services the manager consumes opportunistically. */
-async function setup(script: Script) {
+async function setup(script: Script, adapter?: { providers?: readonly string[]; reasoning?: LlmModelReasoningInfo }) {
   const ctx = new Context()
   contexts.push(ctx)
   await mountAgentLoopTestDependencies(ctx)
@@ -50,7 +50,10 @@ async function setup(script: Script) {
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
   await ctx.plugin(SubagentFork, { providerName: 'fork' })
-  ctx.llm.registerAdapter(['mock'], new MockAdapter(script))
+  ctx.llm.registerAdapter(
+    adapter?.providers ?? ['mock'],
+    new MockAdapter(script, adapter?.reasoning),
+  )
   const parent = ctx.agentLoop.create(SessionId('parent'), { provider: 'mock', model: 'mock' })
   return { ctx, parent }
 }
@@ -369,5 +372,58 @@ describe('continuable agent route inheritance (live header)', () => {
       agentProvider: requestedProvider,
       agentModel: requestedModel,
     })
+  })
+
+  it('installs the requested modelSelection on the child before its first request', { timeout: 20_000 }, async () => {
+    // The child must run the selected route and effort, not the model's
+    // adapter default: register the selected provider with 'max' as a real
+    // effort so the turn completes and the logged header records the selection.
+    const { ctx, parent } = await setup(
+      [textResponse('child done')],
+      {
+        providers: ['mock', 'live-provider'],
+        reasoning: { efforts: [{ id: ReasoningEffortId('max'), name: 'Max' }] },
+      },
+    )
+    const spec = {
+      provider: 'spawn',
+      label: 'child task',
+      request: {
+        prompt: [{ type: 'text' as const, text: 'child task' }],
+        parent,
+        modelSelection: {
+          provider: 'live-provider',
+          model: 'live-model',
+          reasoningEffort: ReasoningEffortId('max'),
+        },
+      },
+      signal: new AbortController().signal,
+    }
+    const started = await ctx.subagents.startContinuable(spec)
+    await waitNoActivation(ctx, started.childId)
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    const header = loaded.events.find(
+      (event): event is SessionEvent<'request/header'> => event.type === 'request/header',
+    )
+    expect(header?.data.header.config).toMatchObject({
+      provider: 'live-provider',
+      model: 'live-model',
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+  })
+
+  it('leaves the child at the adapter default when no modelSelection is requested', { timeout: 20_000 }, async () => {
+    const { ctx, parent } = await setup([textResponse('child done')])
+    const started = await ctx.subagents.startContinuable(startSpec(parent))
+    await waitNoActivation(ctx, started.childId)
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    const header = loaded.events.find(
+      (event): event is SessionEvent<'request/header'> => event.type === 'request/header',
+    )
+    expect(header?.data.header.config.provider).toBe('mock')
+    expect(header?.data.header.config.model).toBe('mock')
+    expect(header?.data.header.config.reasoningEffort).toBeUndefined()
   })
 })

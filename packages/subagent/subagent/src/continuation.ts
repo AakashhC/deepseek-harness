@@ -23,12 +23,14 @@
 
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type {
   Agent,
   AgentHandle,
   AgentOptions,
   AgentSetupCommit,
   CreateAgentOptions,
+  ModelSelection,
 } from '@deepseek-ai/dsh-agent'
 import { boundContextSummary, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
@@ -257,6 +259,14 @@ interface MaterializeInputs {
     delegatedPolicies: DelegatedPolicyOverrides
   }
   agentOptions: AgentOptions
+  /**
+   * Canonical model selection installed on the child before its first prompt
+   * assembly. Present only on a fresh creation: the v2 descriptor records no
+   * effort, so a cold-resumed child loses the selection and runs its model's
+   * adapter default (acceptable — the live first spawn is the gate this
+   * mechanism opens).
+   */
+  modelSelection?: ModelSelection
   composition: { persona?: string | undefined; toolFilter?: ToolRestriction | undefined }
   signal: AbortSignal
 }
@@ -416,6 +426,10 @@ export class SubagentContinuationManager {
     // header (`parent.session.requestHeader()?.config`) then the frozen
     // `parent.options`, with `requested` winning. `inheritedAgentRoute` is the
     // single home for that fallback so the two sites cannot diverge.
+    // `modelSelection` is deliberately NOT recorded: like `maxTokens`, it
+    // budgets the live activation, so a cold-resumed child loses the requested
+    // effort and runs its model's adapter default (the v2 descriptor schema is
+    // unchanged; the live first spawn is the gate this fix opens).
     const inherited = inheritedAgentRoute(parent)
     const agentProvider = request.agentOptions?.provider ?? inherited.provider
     const agentModel = request.agentOptions?.model ?? inherited.model
@@ -449,6 +463,7 @@ export class SubagentContinuationManager {
         parent,
         create: { seed, meta: childSessionMeta(parent, childDepth, lineageSeedLength), delegatedPolicies },
         agentOptions: resolveChildAgentOptions(parent, request.agentOptions, childDepth),
+        ...request.modelSelection !== undefined ? { modelSelection: request.modelSelection } : {},
         composition: { persona: request.persona, toolFilter: request.toolFilter },
         signal: spec.signal,
       })
@@ -1008,6 +1023,12 @@ export class SubagentContinuationManager {
         appendDelegatedPolicyOverrides((childCtx.agent as Agent).session, create.delegatedPolicies)
       }
       applyChildComposition(childCtx, parent, inputs.composition)
+      if (inputs.modelSelection !== undefined) {
+        installModelSelection(childCtx, {
+          current: { ...inputs.modelSelection },
+          assembled: undefined,
+        })
+      }
       return this.setupRegistry.apply(childCtx)
     }
     const observer = this.host.observeActivation(provider, childId, parent)

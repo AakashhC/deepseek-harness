@@ -9,7 +9,7 @@
  * @module @deepseek-ai/dsh-subagent/types
  */
 
-import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
@@ -117,6 +117,8 @@ export interface SubagentStartRequest {
    */
   readonly signal: AbortSignal
   readonly agentOptions?: AgentOptions
+  /** Canonical model selection installed on the child before its first prompt assembly. */
+  readonly modelSelection?: ModelSelection
   /**
    * Object-rooted JSON Schema within `assertObjectJsonSchema`'s enforced subset. Start rejects
    * unsupported schemas or providers without the capability. Data must be plain host-realm JSON;
