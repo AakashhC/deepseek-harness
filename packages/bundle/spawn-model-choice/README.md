@@ -55,7 +55,7 @@ All keys are optional; omitting `config` keeps the defaults. Configure them on t
 | `askForSpawn` | `boolean` | `true` | When `true`, every spawn lacking explicit model choice triggers the ask. When `false`, never asks (useful to keep the plugin mounted but dormant). |
 | `parentModelRecommendation` | `boolean` | `true` | When `true`, a cheap `llmText` classification call judges task complexity (`simple`/`medium`/`hard` via `\bhard\b` / `\bsimple\b`) and tags the matching tier **(Recommended)** and moves it first. When `false`, the default order is used and no LLM call is made. |
 | `askWhenExplicit` | `boolean` | `false` | When `false`, spawns that already carry an explicit model choice (`provider`/`model`/`reasoningEffort` only — sizing keys like `maxTokens` do not count) are not intercepted. When `true`, they are asked too. |
-| `maxManualOptions` | `number` | `3` | How many non-default models (those not already offered as Balanced/Correctness/Cost) to list individually, cheapest-first. Each is shown at its deepest declared effort. |
+| `maxManualOptions` | `number` | `1` | How many non-default models (those not already offered as the three tiers) to list individually, cheapest-first. Default 1 keeps the card at ≤4 visible options (3 tiers + 1 manual) for a money decision; configurable up to 10. Each is shown at its deepest declared effort. |
 | `qualityRank` | `Record<string, number>` | `{}` | Optional quality ranking — `"provider/model": number`. When any entry is ranked, the **Correctness** tier picks the top-ranked entry; otherwise it picks the highest-priced route. Unranked entries never win when a rank exists. |
 | `recommender` | `{ provider, model, reasoningEffort? } \| undefined` | `undefined` | Optional route for the classification call. When set, that route is used; otherwise the parent model at its **lowest declared effort** is used (the cheapest honest judgment this menu can make). |
 | `logFile` | `string \| undefined` | `undefined` | Optional file path for redacted diagnostic logging. When unset, file logging is **disabled** (bundle default: OFF, no-op). When set to a path, appends lines with `node:fs/promises` (`appendFile` + `1MB` rotation via `stat`/`unlink`), never throws, never blocks the spawn path. Log lines are sanitized via `cleanText`. |
@@ -69,7 +69,7 @@ Example override in `profiles/<name>/cordis.patch.yml`:
     askForSpawn: true
     parentModelRecommendation: true
     askWhenExplicit: false
-    maxManualOptions: 3
+    maxManualOptions: 1
     qualityRank:
       deepseek/deepseek-chat: 10
       anthropic/claude-sonnet-4: 9

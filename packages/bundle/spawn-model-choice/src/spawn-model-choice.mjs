@@ -48,7 +48,10 @@
  *   askForSpawn: true              — ask on every spawn lacking explicit options
  *   parentModelRecommendation: true — let a cheap LLM call pick the recommended tier
  *   askWhenExplicit: false         — also ask when the spawn names a route already
- *   maxManualOptions: 3            — how many non-default models to list individually
+ *   maxManualOptions: 1            — **how many non-default models to list
+ *                                    individually** (default 1 keeps the card at ≤4
+ *                                    visible options: 3 tiers + 1 manual;
+ *                                    configurable up to 10)
  *   qualityRank: {}                — "provider/model": number; the Correctness tier
  *                                    picks the top rank when any entry is ranked
  *   recommender: undefined         — { provider, model, reasoningEffort } for the
@@ -64,6 +67,7 @@
 
 const name = 'spawn-model-choice'
 const inject = ['subagents', 'userQuestions', 'settings', 'llm', 'agentDefaultModel']
+import { appendFile, readFile, stat, unlink } from 'node:fs/promises'
 
 /** Local diagnostic log. The LOCAL profile defaults to /tmp (single-user
  *  machine, sanitized lines); the upstream bundle defaults to OFF and only
@@ -73,13 +77,13 @@ let LOG_FILE = null
 /** Append one line to the plugin log (async, never throws, never blocks; rotates at 1MB). */
 function logLine(line) {
   if (!LOG_FILE) return
-  import('node:fs/promises').then(async ({ appendFile, stat, unlink }) => {
+  ;(async () => {
     try {
       const { size } = await stat(LOG_FILE)
       if (size > 1024 * 1024) await unlink(LOG_FILE).catch(() => {})
     } catch { /* first write */ }
     await appendFile(LOG_FILE, `${new Date().toISOString()} ${line}\n`)
-  }).catch(() => {})
+  })().catch(() => {})
 }
 
 const DEFAULT_CONFIG = {
@@ -87,7 +91,7 @@ const DEFAULT_CONFIG = {
   askForSpawn: true,
   parentModelRecommendation: true,
   askWhenExplicit: false,
-  maxManualOptions: 3,
+  maxManualOptions: 1,
   qualityRank: {},
   recommender: undefined,
   logFile: undefined,
@@ -111,7 +115,6 @@ async function readSettingsProviders(ctx) {
   try {
     const path = ctx.settings?.documentPath
     if (!path) return {}
-    const { readFile } = await import('node:fs/promises')
     const { parse } = await import('yaml')
     const doc = parse(await readFile(path, 'utf8'))
     return {
@@ -216,9 +219,13 @@ async function buildModelTable(ctx) {
         // Catalog PRICING is independent of the effort source.
         try {
           const catalog = catalogIndex.get(catalogRoute)?.get(info.id)
-          if (catalog?.cost) {
+          // Both prices must be REAL numbers: blending with a missing side
+          // (?? 0) would fabricate a halved "est." figure.
+          if (catalog?.cost
+            && typeof catalog.cost.input === 'number'
+            && typeof catalog.cost.output === 'number') {
             // pi-ai catalog costs are USD per 1M tokens; blend input+output.
-            const blended = ((catalog.cost.input ?? 0) + (catalog.cost.output ?? 0)) / 2
+            const blended = (catalog.cost.input + catalog.cost.output) / 2
             cost = blended >= 0 ? blended : UNKNOWN_COST
           }
         } catch { /* catalog lookup is best-effort */ }
@@ -622,9 +629,11 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     ? { provider: request.parent.options.provider, model: request.parent.options.model }
     : defaultModel
   let recommended = 'balanced'
+  let judged = false
   if (cfg.parentModelRecommendation !== false && rawTask && judge.provider) {
     try {
       recommended = await classifyTask(ctx, cfg, judge, table, rawTask, request.signal)
+      judged = true
     } catch (error) {
       logLine(`classify: ERROR ${String(error?.message ?? error)}`)
     }
@@ -649,14 +658,15 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     const rank = rankOf(correctness)
     // The label never implies an empirical quality judgment the plugin has
     // not made: "Correctness" only when a qualityRank exists; otherwise the
-    // tier is honestly named by its actual criterion.
-    const tierLabel = correctnessBy === 'rank' ? 'Correctness' : 'Highest-priced'
+    // tier names its actual criterion — the deepest effort — with the price
+    // shown as an estimate, never as a quality claim.
+    const tierLabel = correctnessBy === 'rank' ? 'Correctness' : 'Maximum effort'
     tiers.push({
       key: 'correctness',
       label: registerChoice(choiceMap, tierLabel, correctness.provider, correctness.model, eff),
       description: correctnessBy === 'rank'
         ? `Top quality rank (${rank}) — ${correctness.name} at ${eff}${priceSuffix(correctness)}`
-        : `Highest estimated price — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
+        : `Deepest reasoning — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
       group: 'Tiers',
     })
   }
@@ -670,19 +680,23 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     })
   }
 
-  // The parent-model-chosen tier is tagged (Recommended) and moved first,
-  // with its judgment visible so the tag reads as advice, not authority.
-  const rationale = { correctness: 'judged hard', cost: 'judged simple', balanced: 'judged medium' }[recommended]
-  const recommendedTier = tiers.find((t) => t.key === recommended) ?? tiers[0]
-  if (recommendedTier) {
-    const plain = recommendedTier.label
-    const tagged = `${plain} (Recommended)`
-    choiceMap.set(tagged, choiceMap.get(plain))
-    recommendedTier.label = tagged
-    recommendedTier.description = `Recommended for this task (${rationale}). ${recommendedTier.description}`
-    if (tiers[0] !== recommendedTier) {
-      tiers.splice(tiers.indexOf(recommendedTier), 1)
-      tiers.unshift(recommendedTier)
+  // The parent-model-chosen tier is tagged (Recommended) and moved first —
+  // ONLY when a judgment actually ran (a verdict must never be asserted
+  // without one: disabled recommendation, no task, no judge, or a failed
+  // classify leaves every tier untagged). The rationale reads as advice.
+  if (judged) {
+    const rationale = { correctness: 'hard', cost: 'simple', balanced: 'medium' }[recommended] ?? 'medium'
+    const recommendedTier = tiers.find((t) => t.key === recommended) ?? tiers[0]
+    if (recommendedTier) {
+      const plain = recommendedTier.label
+      const tagged = `${plain} (Recommended)`
+      choiceMap.set(tagged, choiceMap.get(plain))
+      recommendedTier.label = tagged
+      recommendedTier.description = `Suggested for this task — looks ${rationale} complexity. ${recommendedTier.description}`
+      if (tiers[0] !== recommendedTier) {
+        tiers.splice(tiers.indexOf(recommendedTier), 1)
+        tiers.unshift(recommendedTier)
+      }
     }
   }
 
@@ -697,7 +711,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
   const rest = [...table.values()]
     .filter((entry) => !skipEntries.has(`${entry.provider}/${entry.model}`))
     .sort((a, b) => (a.cost ?? Infinity) - (b.cost ?? Infinity))
-    .slice(0, cfg.maxManualOptions ?? 3)
+    .slice(0, cfg.maxManualOptions ?? 1)
   for (const entry of rest) {
     const active = activeEfforts(entry)
     const e = active[active.length - 1] // deepest declared effort, undefined when none
@@ -881,11 +895,17 @@ async function validateCandidate(ctx, candidate, signal) {
   const options = candidate?.agentOptions
   if (!options?.provider || !options?.model || !ctx.llm?.resolveCallConfig) return true
   try {
+    // Validate EVERY route/sampling field the final merged request carries —
+    // not just the chosen route: a field that survived the merge unchanged
+    // (effort, maxTokens, temperature, stop) must also be admissible.
+    const { provider, model, reasoningEffort, maxTokens, temperature, stop } = options
     await ctx.llm.resolveCallConfig({
-      provider: options.provider,
-      model: options.model,
-      ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
-      ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+      provider,
+      model,
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(stop !== undefined ? { stop } : {}),
     }, signal)
     return true
   } catch (error) {
