@@ -33,7 +33,7 @@ import type {
   ModelSelection,
 } from '@deepseek-ai/dsh-agent'
 import { boundContextSummary, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, MessageId, MessageSource, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
@@ -261,10 +261,9 @@ interface MaterializeInputs {
   agentOptions: AgentOptions
   /**
    * Canonical model selection installed on the child before its first prompt
-   * assembly. Present only on a fresh creation: the v2 descriptor records no
-   * effort, so a cold-resumed child loses the selection and runs its model's
-   * adapter default (acceptable — the live first spawn is the gate this
-   * mechanism opens).
+   * assembly. Present on fresh creation and, via the v3 descriptor's
+   * `agentReasoningEffort`, on a cold resume that reconstructs the selection
+   * so the resumed child's first request preserves the original effort.
    */
   modelSelection?: ModelSelection
   composition: { persona?: string | undefined; toolFilter?: ToolRestriction | undefined }
@@ -425,20 +424,24 @@ export class SubagentContinuationManager {
     // agent will resolve via `resolveChildAgentOptions` — the parent's live
     // header (`parent.session.requestHeader()?.config`) then the frozen
     // `parent.options`, with `requested` winning. `inheritedAgentRoute` is the
-    // single home for that fallback so the two sites cannot diverge.
-    // `modelSelection` is deliberately NOT recorded: like `maxTokens`, it
-    // budgets the live activation, so a cold-resumed child loses the requested
-    // effort and runs its model's adapter default (the v2 descriptor schema is
-    // unchanged; the live first spawn is the gate this fix opens).
+    // single home for that fallback so the two sites cannot diverge. The
+    // descriptor also persists the installed model selection (v3) so a cold
+    // resume can reconstruct it: prefer `request.modelSelection`'s
+    // provider/model/effort (the selection that wins prompt assembly and the
+    // request header), else `request.agentOptions`, else the parent's live
+    // header (`parent.session.requestHeader()?.config`), else omit.
     const inherited = inheritedAgentRoute(parent)
-    const agentProvider = request.agentOptions?.provider ?? inherited.provider
-    const agentModel = request.agentOptions?.model ?? inherited.model
+    const agentProvider = request.modelSelection?.provider ?? request.agentOptions?.provider ?? inherited.provider
+    const agentModel = request.modelSelection?.model ?? request.agentOptions?.model ?? inherited.model
+    const agentReasoningEffort = request.modelSelection?.reasoningEffort
+      ?? (parent.session.requestHeader()?.config as { reasoningEffort?: string } | undefined)?.reasoningEffort
     const descriptor = snapshotSubagentDescriptor({
       mode: 'continuable',
       provider: spec.provider,
       label: spec.label,
       ...agentProvider !== undefined ? { agentProvider } : {},
       ...agentModel !== undefined ? { agentModel } : {},
+      ...agentReasoningEffort !== undefined ? { agentReasoningEffort } : {},
       ...request.persona !== undefined ? { persona: request.persona } : {},
       ...request.toolFilter !== undefined ? { toolFilter: request.toolFilter } : {},
     })
@@ -932,6 +935,14 @@ export class SubagentContinuationManager {
         'NOT_RESUMABLE',
       )
     }
+    const continuableDesc = descriptor as Extract<SubagentDescriptorData, { mode: 'continuable' }>
+    const coldModelSelection = continuableDesc.agentReasoningEffort !== undefined
+      ? {
+        ...(continuableDesc.agentProvider !== undefined ? { provider: continuableDesc.agentProvider } : {}),
+        ...(continuableDesc.agentModel !== undefined ? { model: continuableDesc.agentModel } : {}),
+        reasoningEffort: continuableDesc.agentReasoningEffort as unknown as ReasoningEffortId,
+      } as ModelSelection
+      : undefined
     let activation: Activation
     try {
       activation = await this.materialize({
@@ -942,6 +953,7 @@ export class SubagentContinuationManager {
           ...descriptor.agentProvider !== undefined ? { provider: descriptor.agentProvider } : {},
           ...descriptor.agentModel !== undefined ? { model: descriptor.agentModel } : {},
         },
+        ...(coldModelSelection !== undefined ? { modelSelection: coldModelSelection } : {}),
         composition: { persona: descriptor.persona, toolFilter: descriptor.toolFilter },
         signal: options.signal,
       })

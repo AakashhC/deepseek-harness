@@ -23,7 +23,7 @@ import * as SubagentFork from '@deepseek-ai/dsh-subagent-fork-in-process'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import ApprovalService, { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
-import SubagentRuntime from '../src/index.ts'
+import SubagentRuntime, { SUBAGENT_DESCRIPTOR_VERSION } from '../src/index.ts'
 import { inheritedAgentRoute, resolveChildAgentOptions } from '../src/child-agent.ts'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 
@@ -425,5 +425,105 @@ describe('continuable agent route inheritance (live header)', () => {
     expect(header?.data.header.config.provider).toBe('mock')
     expect(header?.data.header.config.model).toBe('mock')
     expect(header?.data.header.config.reasoningEffort).toBeUndefined()
+  })
+
+  it('persists the selected reasoning effort in the v3 descriptor', { timeout: 20_000 }, async () => {
+    const { ctx, parent } = await setup(
+      [textResponse('child done')],
+      {
+        providers: ['mock', 'live-provider'],
+        reasoning: { efforts: [{ id: ReasoningEffortId('max'), name: 'Max' }] },
+      },
+    )
+    const spec = {
+      provider: 'spawn',
+      label: 'child task',
+      request: {
+        prompt: [{ type: 'text' as const, text: 'child task' }],
+        parent,
+        modelSelection: {
+          provider: 'live-provider',
+          model: 'live-model',
+          reasoningEffort: ReasoningEffortId('max'),
+        },
+      },
+      signal: new AbortController().signal,
+    }
+    const started = await ctx.subagents.startContinuable(spec)
+    await waitNoActivation(ctx, started.childId)
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    const descriptor = loaded.events.find(
+      (event): event is SessionEvent<'subagent/descriptor'> => event.type === 'subagent/descriptor',
+    )
+    expect(descriptor?.data.version).toBe(SUBAGENT_DESCRIPTOR_VERSION)
+    expect(descriptor?.data.version).toBe(3)
+    expect((descriptor?.data as unknown as { agentReasoningEffort?: string }).agentReasoningEffort).toBe('max')
+    expect(descriptor?.data).toMatchObject({
+      version: 3,
+      mode: 'continuable',
+      agentProvider: 'live-provider',
+      agentModel: 'live-model',
+      agentReasoningEffort: 'max',
+    })
+  })
+
+  it('cold-resumes with the persisted reasoning effort after the activation is gone', { timeout: 20_000 }, async () => {
+    const { ctx, parent } = await setup(
+      [textResponse('first'), textResponse('after resume')],
+      {
+        providers: ['mock', 'live-provider'],
+        reasoning: { efforts: [{ id: ReasoningEffortId('max'), name: 'Max' }] },
+      },
+    )
+    const spec = {
+      provider: 'spawn',
+      label: 'child task',
+      request: {
+        prompt: [{ type: 'text' as const, text: 'child task' }],
+        parent,
+        modelSelection: {
+          provider: 'live-provider',
+          model: 'live-model',
+          reasoningEffort: ReasoningEffortId('max'),
+        },
+      },
+      signal: new AbortController().signal,
+    }
+    const started = await ctx.subagents.startContinuable(spec)
+    // Crash simulation: wait for the live Activation to settle and be disposed.
+    // This removes the child from memory, so the next followup must cold-resume
+    // from the persisted descriptor (which now carries agentReasoningEffort).
+    await waitNoActivation(ctx, started.childId)
+    expect(ctx.agents.get(started.childId)).toBeUndefined()
+
+    await ctx.subagents.followup(parent, started.childId, [{ type: 'text', text: 'continue please' }], {
+      source: { kind: 'user' },
+      signal: new AbortController().signal,
+    })
+    await waitNoActivation(ctx, started.childId)
+
+    const loaded = await ctx.sessionPersistence.load(started.childId)
+    const headers = loaded.events.filter(
+      (event): event is SessionEvent<'request/header'> => event.type === 'request/header',
+    )
+    // Two turns: the initial continuable creation and the cold-resumed followup.
+    // Both must carry the persisted effort; the second proves the cold-resume
+    // reconstruction via descriptor-derived modelSelection.
+    expect(headers.length).toBeGreaterThanOrEqual(2)
+    expect(headers[0]?.data.header.config).toMatchObject({
+      provider: 'live-provider',
+      model: 'live-model',
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    expect(headers[1]?.data.header.config).toMatchObject({
+      provider: 'live-provider',
+      model: 'live-model',
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    const descriptor = loaded.events.find(
+      (event): event is SessionEvent<'subagent/descriptor'> => event.type === 'subagent/descriptor',
+    )
+    expect((descriptor?.data as unknown as { agentReasoningEffort?: string }).agentReasoningEffort).toBe('max')
   })
 })
