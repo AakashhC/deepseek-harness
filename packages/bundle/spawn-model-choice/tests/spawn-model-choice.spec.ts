@@ -84,9 +84,9 @@ describe('spawn-model-choice helpers', () => {
       }
       const chosen = { provider: 'new-p', model: 'new-m', effort: 'xhigh' }
       const out = withAgentOptions(request, chosen)
-      expect(out.agentOptions.provider).toBe('new-p')
-      expect(out.agentOptions.model).toBe('new-m')
-      expect(out.agentOptions.reasoningEffort).toBe('xhigh')
+      expect(out.agentOptions!.provider).toBe('new-p')
+      expect(out.agentOptions!.model).toBe('new-m')
+      expect(out.agentOptions!.reasoningEffort).toBe('xhigh')
     })
 
     it('clears the original explicit reasoningEffort on a route switch (no-effort choice = model default)', () => {
@@ -97,8 +97,8 @@ describe('spawn-model-choice helpers', () => {
       }
       const chosen = { provider: 'new-p', model: 'new-m', effort: undefined }
       const out = withAgentOptions(request, chosen)
-      expect(out.agentOptions.reasoningEffort).toBeUndefined()
-      expect(out.agentOptions.provider).toBe('new-p')
+      expect(out.agentOptions!.reasoningEffort).toBeUndefined()
+      expect(out.agentOptions!.provider).toBe('new-p')
       expect(out.modelSelection).toEqual({ provider: 'new-p', model: 'new-m' })
     })
 
@@ -535,7 +535,7 @@ describe('spawn-model-choice helpers', () => {
       expect([...result.keys()].every(k => k.includes('/'))).toBe(true)
       expect(result.has('p/cheap-fuzzy')).toBe(true)
       expect([...result.keys()][0]).toBe('p/cheap-fuzzy')
-      expect([...result.values()][0].model).toBe('cheap-fuzzy')
+      expect([...result.values()][0]!.model).toBe('cheap-fuzzy')
       expect(result.get('p/cheap-fuzzy')?.name).toBe('Cheap FuzzyUnique')
     })
   })
@@ -546,9 +546,9 @@ describe('spawn-model-choice helpers', () => {
         { agentOptions: { provider: 'old', model: 'old-model', reasoningEffort: 'xhigh', maxTokens: 123 } },
         { provider: 'new', model: 'new-model', effort: undefined },
       )
-      expect(out.agentOptions.reasoningEffort).toBeUndefined()
-      expect(out.agentOptions.provider).toBe('new')
-      expect(out.agentOptions.maxTokens).toBe(123)
+      expect(out.agentOptions!.reasoningEffort).toBeUndefined()
+      expect(out.agentOptions!.provider).toBe('new')
+      expect(out.agentOptions!.maxTokens).toBe(123)
       expect(out.modelSelection).toEqual({ provider: 'new', model: 'new-model' })
     })
 
@@ -557,7 +557,7 @@ describe('spawn-model-choice helpers', () => {
         { agentOptions: { provider: 'p', model: 'm', reasoningEffort: 'high' } },
         { provider: 'p', model: 'm', effort: undefined },
       )
-      expect(out.agentOptions.reasoningEffort).toBeUndefined()
+      expect(out.agentOptions!.reasoningEffort).toBeUndefined()
       expect(out.modelSelection).toEqual({ provider: 'p', model: 'm' })
     })
 
@@ -566,7 +566,7 @@ describe('spawn-model-choice helpers', () => {
         { label: 'x', agentOptions: { provider: 'old', model: 'old-m', reasoningEffort: 'low' }, prompt: [] },
         { provider: 'p', model: 'm', effort: 'high' },
       )
-      expect(out.agentOptions.reasoningEffort).toBe('high')
+      expect(out.agentOptions!.reasoningEffort).toBe('high')
       expect(out.modelSelection).toEqual({ provider: 'p', model: 'm', reasoningEffort: 'high' })
     })
 
@@ -575,7 +575,7 @@ describe('spawn-model-choice helpers', () => {
         { label: 'x', prompt: [] },
         { provider: 'p', model: 'm', effort: undefined },
       )
-      expect(out.agentOptions.reasoningEffort).toBeUndefined()
+      expect(out.agentOptions!.reasoningEffort).toBeUndefined()
       expect(out.modelSelection).toEqual({ provider: 'p', model: 'm' })
       expect(out.modelSelection).not.toHaveProperty('reasoningEffort')
     })
@@ -723,13 +723,15 @@ describe('spawn-model-choice helpers', () => {
         ['p/expensive', { provider: 'p', model: 'expensive',
           name: 'Expensive', efforts: ['low'], cost: 100, priced: true }],
       ])
-      const cheapest = [...table.values()].filter(e => e.cost !== null)
+      const priced = (e: Row): e is Row & { cost: number } => e.cost !== null
+      const cheapest = [...table.values()].filter(priced)
         .reduce((best, e) => (best === undefined || e.cost < best.cost ? e : best),
-          undefined as never)
+          undefined as Row & { cost: number } | undefined)
       expect(cheapest?.model).toBe('cheap-no-effort')
-      const oldCheapest = [...table.values()]
-        .filter(e => e.cost !== null && (e.efforts ?? []).filter(x => x !== 'off').length > 0)
-        .reduce((a, b) => (a.cost < b.cost ? a : b), [...table.values()][1] as never)
+      const withEfforts = (e: Row): e is Row & { cost: number } =>
+        e.cost !== null && (e.efforts ?? []).filter(x => x !== 'off').length > 0
+      const oldCheapest = [...table.values()].filter(withEfforts)
+        .reduce((a, b) => (a.cost < b.cost ? a : b), [...table.values()][1] as Row & { cost: number })
       expect(oldCheapest.model).not.toBe('cheap-no-effort')
     })
 
