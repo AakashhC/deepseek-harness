@@ -62,6 +62,17 @@ describe('spawn-model-choice helpers', () => {
       const text = '{ not json } {"valid":42} trailing'
       expect(extractJson(text)).toEqual({ valid: 42 })
     })
+
+    it('ignores braces inside JSON strings (string-aware scanner)', () => {
+      // Braces inside a string value (escaped or not) must not count toward
+      // the depth: this object closes exactly at its own final brace.
+      const text = 'reply: {"a":"{not a brace}","b":"escaped \\" brace {"} done'
+      expect(extractJson(text)).toEqual({ a: '{not a brace}', b: 'escaped " brace {' })
+    })
+
+    it('still rejects an unclosed object after a string with braces', () => {
+      expect(extractJson('{"a":"{nested"')).toBeUndefined()
+    })
   })
 
   describe('withAgentOptions', () => {
@@ -369,6 +380,19 @@ describe('spawn-model-choice helpers', () => {
       expect(effortFromText(entry as never, 'please use xhigh')).toBe('xhigh')
     })
 
+    it('identifier boundaries: high must not match inside xhigh, low not inside flow', () => {
+      const entry = table.get('provA/model-a')!
+      // efforts: low, medium, xhigh — 'high' is not a declared id for this
+      // entry, and must not be matched as a substring of 'xhigh' either.
+      expect(effortFromText(entry as never, 'run at high')).toBeUndefined()
+      // 'low' is declared but must not match inside 'flow' or 'slow'.
+      expect(effortFromText(entry as never, 'flow state')).toBeUndefined()
+      expect(effortFromText(entry as never, 'take it slow')).toBeUndefined()
+      // Declared id at the start or end of the text still matches.
+      expect(effortFromText(entry as never, 'xhigh now')).toBe('xhigh')
+      expect(effortFromText(entry as never, 'go low')).toBe('low')
+    })
+
     it('xtra maps to deepest declared', () => {
       const entry = table.get('provA/model-a')!
       // efforts: low, medium, xhigh → deepest is xhigh
@@ -572,6 +596,29 @@ describe('spawn-model-choice helpers', () => {
       expect(normalizeConfig({ maxManualOptions: -3 }).maxManualOptions).toBe(0)
     })
 
+    it('normalizeConfig enables only literal boolean true values', () => {
+      const cfg = normalizeConfig({
+        enabled: 'false',
+        askForSpawn: 'false',
+        parentModelRecommendation: 'false',
+        askWhenExplicit: 'true',
+        logUserInput: 'false',
+      } as never)
+      expect(cfg.enabled).toBe(false)
+      expect(cfg.askForSpawn).toBe(false)
+      expect(cfg.parentModelRecommendation).toBe(false)
+      expect(cfg.askWhenExplicit).toBe(false)
+      expect(cfg.logUserInput).toBe(false)
+      expect(normalizeConfig({ enabled: true, askForSpawn: true,
+        parentModelRecommendation: true, askWhenExplicit: true, logUserInput: true })).toMatchObject({
+        enabled: true,
+        askForSpawn: true,
+        parentModelRecommendation: true,
+        askWhenExplicit: true,
+        logUserInput: true,
+      })
+    })
+
     it('validateCandidate validates the FINAL merged agentOptions', async () => {
       const calls: Array<{ cfg: Record<string, unknown>; signal: unknown }> = []
       const ctx = {
@@ -758,6 +805,41 @@ describe('spawn-model-choice helpers', () => {
       expect(ask2).toBe(0)
       await wrappedCont({ provider: 'fork', label: 'x', request: req, signal: undefined })
       expect(ask2).toBe(1)
+      disposer?.()
+    })
+
+    it('skips asking when modelSelection is already explicit', async () => {
+      let askCalls = 0
+      let disposer: (() => void) | undefined
+      let received: unknown
+      const originalStart = async (_provider: string, request: unknown) => {
+        received = request
+        return 'ok'
+      }
+      const subagents = { start: originalStart } as never as Record<string, unknown>
+      const ctx = {
+        effect: (fn: () => (() => void) | undefined) => { disposer = fn() },
+        on: () => () => {},
+        subagents,
+        agents: { roots: () => [] },
+        userQuestions: { ask: async () => {
+          askCalls += 1
+          return { answers: [] }
+        } },
+        settings: {},
+        llm: {},
+        agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+      }
+      apply(ctx as never, { enabled: true, askForSpawn: true, askWhenExplicit: false })
+      const request = {
+        label: 'already chosen',
+        prompt: [{ type: 'text', text: 'task' }],
+        parent: {},
+        modelSelection: { provider: 'p', model: 'm', reasoningEffort: 'high' },
+      }
+      await (subagents.start as (provider: string, request: unknown) => Promise<unknown>)('spawn', request)
+      expect(askCalls).toBe(0)
+      expect(received).toBe(request)
       disposer?.()
     })
   })

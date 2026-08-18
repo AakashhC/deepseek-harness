@@ -460,13 +460,25 @@ async function llmText(ctx, judge, messages, signal, options = {}) {
 function extractJson(text) {
   // First balanced JSON object in the reply, tried parseable-first: a greedy
   // match spans several objects and fails, while a non-greedy one breaks on
-  // nested braces. Scanning keeps both cases working.
+  // nested braces. Scanning keeps both cases working — and the scanner is
+  // STRING-AWARE: braces inside JSON strings (escaped or not) never affect
+  // the depth count.
   const s = text ?? ''
   for (let i = s.indexOf('{'); i !== -1; i = s.indexOf('{', i + 1)) {
     let depth = 0
+    let inString = false
+    let escaped = false
     for (let j = i; j < s.length; j++) {
-      if (s[j] === '{') depth++
-      else if (s[j] === '}') {
+      const c = s[j]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (c === '\\') escaped = true
+        else if (c === '"') inString = false
+        continue
+      }
+      if (c === '"') { inString = true; continue }
+      if (c === '{') depth++
+      else if (c === '}') {
         depth--
         if (depth === 0) {
           try {
@@ -540,6 +552,12 @@ function deterministicMatch(table, text) {
   return undefined
 }
 
+/** Identifier-boundary containment: 'high' must not match inside 'xhigh'. */
+function includesIdentifier(text, id) {
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)
+}
+
 /**
  * Effort named in a free-text answer, against ONE entry's declared levels:
  * a declared id mentioned verbatim, else superlative synonyms mapped to the
@@ -550,7 +568,7 @@ function effortFromText(entry, text) {
   const active = activeEfforts(entry)
   if (active.length === 0) return undefined
   const declared = [...active].sort((a, b) => b.length - a.length)
-    .find((e) => t.includes(e.toLowerCase()))
+    .find((e) => includesIdentifier(t, e))
   if (declared) return declared
   if (/\b(max|maximum|deepest|deep|xtra|extreme|highest|strongest)\b/.test(t)) return active[active.length - 1]
   if (/\b(min|minimum|lightest|lowest|cheapest|fastest)\b/.test(t)) return active[0]
@@ -690,7 +708,7 @@ async function askModel(ctx, cfg, request, table, defaultModel) {
     tiers.push({
       key: 'correctness',
       label: registerChoice(choiceMap, 'Correctness', correctness.provider, correctness.model, eff),
-      description: `Top quality rank (${rank}) — ${correctness.name} at ${eff}${priceSuffix(correctness)}`,
+      description: `Top quality rank (${rank}) — ${correctness.name} at ${eff ?? 'model default'}${priceSuffix(correctness)}`,
       group: 'Tiers',
     })
   }
@@ -985,6 +1003,12 @@ function normalizeConfig(config) {
     ? { provider: rec.provider, model: rec.model, ...(typeof rec.reasoningEffort === 'string' ? { reasoningEffort: rec.reasoningEffort } : {}) }
     : undefined
   cfg.logFile = (typeof cfg.logFile === 'string' && cfg.logFile.length > 0) ? cfg.logFile : undefined
+  // Booleans: ONLY the literal boolean true enables — a quoted "false"/"true"
+  // string is REJECTED (strings are truthy and would silently enable).
+  cfg.enabled = cfg.enabled === true
+  cfg.askForSpawn = cfg.askForSpawn === true
+  cfg.parentModelRecommendation = cfg.parentModelRecommendation === true
+  cfg.askWhenExplicit = cfg.askWhenExplicit === true
   cfg.logUserInput = cfg.logUserInput === true
   const providers = Array.isArray(cfg.supportedSubagentProviders)
     ? cfg.supportedSubagentProviders.filter((p) => typeof p === 'string' && p.length > 0)
@@ -1059,6 +1083,9 @@ function apply(ctx, config = {}) {
 
   /** Await the shared table build, but stop waiting the moment the spawn aborts. */
   const waitForTable = async (signal) => {
+    // Abort BEFORE starting any expensive work: a signal already aborted at
+    // entry must never kick off the shared discovery build.
+    if (signal?.aborted) throw signal.reason ?? new Error('spawn aborted')
     const build = getTable()
     if (!signal) return build
     if (signal.aborted) throw signal.reason ?? new Error('spawn aborted')
@@ -1100,8 +1127,10 @@ function apply(ctx, config = {}) {
         logLine(`intercept: skip (nested spawn, root-only) label=${labelLog}`)
         return request
       }
-      if (request.agentOptions && hasExplicitModelChoice(request.agentOptions) && !cfg.askWhenExplicit) {
-        logLine(`intercept: skip (explicit agentOptions) label=${labelLog}`)
+      const explicitRoute = (request.agentOptions && hasExplicitModelChoice(request.agentOptions))
+        || (request.modelSelection && hasExplicitModelChoice(request.modelSelection))
+      if (explicitRoute && !cfg.askWhenExplicit) {
+        logLine(`intercept: skip (explicit selection) label=${labelLog}`)
         return request
       }
       if (!cfg.askForSpawn) return request
@@ -1181,7 +1210,9 @@ function apply(ctx, config = {}) {
           delete subagents[WRAP_MARKER]
         }
         for (const off of disposeEvents) { try { off() } catch { /* best-effort */ } }
-        LOG_FILE = previousLogFile
+        // Restore the previous log destination ONLY if it is still ours — a
+        // later application must never be clobbered by an earlier dispose.
+        if (LOG_FILE === cfg.logFile) LOG_FILE = previousLogFile
       } catch { /* best-effort */ }
     }
   }
